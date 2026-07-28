@@ -30,9 +30,9 @@ const PRESETS = [
   { id: "depth", label: "Depth Field" },
 ];
 
-// Box face order: +X, -X, +Y, -Y, +Z, -Z — prefer sides for upright Y-spin
+// Box face order: +X, -X, +Y, -Y, +Z, -Z — images only on upright-capable sides
 const SIDE_FACES = [0, 1, 4, 5];
-const FACE_TEX_ROTATION = [0, Math.PI, 0, Math.PI, 0, Math.PI];
+const TOP_BOTTOM_FACES = [2, 3];
 
 const SHOWCASE_MAX_FEATURED = 3;
 const SHOWCASE_APPROACH_S = 1.35;
@@ -135,7 +135,71 @@ scene.add(root);
 
 // Fewer segments = much cheaper geometry while keeping soft edges
 const geometry = new RoundedBoxGeometry(CUBE_SIZE, CUBE_SIZE, CUBE_SIZE, 1, 0.08);
+orientCubeFaceUVs(geometry);
 const cubeColor = new THREE.Color(0x10131c);
+
+/**
+ * Rebuild 6 material groups and remap side-face UVs so V follows local +Y
+ * (texture "up" ≈ world up when the cube isn't tumbled).
+ */
+function orientCubeFaceUVs(geom) {
+  const pos = geom.attributes.position;
+  const uv = geom.attributes.uv;
+  if (!pos || !uv) return;
+
+  const vertCount = pos.count;
+  const perFace = Math.floor(vertCount / 6);
+  if (perFace < 3) return;
+
+  geom.clearGroups();
+  for (let face = 0; face < 6; face++) {
+    geom.addGroup(face * perFace, perFace, face);
+  }
+
+  // Looking from outside: U = right, V = up (+Y) on side faces
+  const faceAxes = {
+    0: { uAxis: "z", uSign: -1, vAxis: "y", vSign: 1 }, // +X
+    1: { uAxis: "z", uSign: 1, vAxis: "y", vSign: 1 }, // -X
+    4: { uAxis: "x", uSign: 1, vAxis: "y", vSign: 1 }, // +Z
+    5: { uAxis: "x", uSign: -1, vAxis: "y", vSign: 1 }, // -Z
+  };
+
+  const axisGetter = {
+    x: (i) => pos.getX(i),
+    y: (i) => pos.getY(i),
+    z: (i) => pos.getZ(i),
+  };
+
+  for (const face of SIDE_FACES) {
+    const axes = faceAxes[face];
+    const start = face * perFace;
+    const end = start + perFace;
+    let uMin = Infinity;
+    let uMax = -Infinity;
+    let vMin = Infinity;
+    let vMax = -Infinity;
+
+    for (let i = start; i < end; i++) {
+      const u = axisGetter[axes.uAxis](i) * axes.uSign;
+      const v = axisGetter[axes.vAxis](i) * axes.vSign;
+      if (u < uMin) uMin = u;
+      if (u > uMax) uMax = u;
+      if (v < vMin) vMin = v;
+      if (v > vMax) vMax = v;
+    }
+
+    const uSpan = Math.max(1e-6, uMax - uMin);
+    const vSpan = Math.max(1e-6, vMax - vMin);
+
+    for (let i = start; i < end; i++) {
+      const u = (axisGetter[axes.uAxis](i) * axes.uSign - uMin) / uSpan;
+      const v = (axisGetter[axes.vAxis](i) * axes.vSign - vMin) / vSpan;
+      uv.setXY(i, u, v);
+    }
+  }
+
+  uv.needsUpdate = true;
+}
 
 function makeBaseMaterial() {
   // Standard is far cheaper than Physical+clearcoat+iridescence
@@ -840,10 +904,13 @@ function ensureOrientedTexture(slot, faceIndex, baseTexture) {
     slot.orientedTexture.wrapS = THREE.ClampToEdgeWrapping;
     slot.orientedTexture.wrapT = THREE.ClampToEdgeWrapping;
     slot.orientedTexture.center.set(0.5, 0.5);
+    slot.orientedTexture.rotation = 0;
     slot.orientedTexture.anisotropy = baseTexture.anisotropy;
   }
+  // UVs are baked upright on the shared geometry — keep source flipY
   slot.orientedTexture.image = baseTexture.image;
-  slot.orientedTexture.rotation = FACE_TEX_ROTATION[faceIndex] ?? 0;
+  slot.orientedTexture.flipY = baseTexture.flipY;
+  slot.orientedTexture.rotation = 0;
   slot.orientedTexture.needsUpdate = true;
   return slot.orientedTexture;
 }
@@ -911,6 +978,8 @@ function faceUprightScore(faceIndex, tile) {
 function beginFaceCycle(tile, faceIndex, image) {
   const slot = tile.faceSlots[faceIndex];
   if (!image) return;
+  // Never place images on top/bottom — they read sideways/upside-down
+  if (!SIDE_FACES.includes(faceIndex)) return;
 
   // Empty face — fade in directly
   if (slot.state === "empty" || !slot.material) {
@@ -934,7 +1003,9 @@ function removeImageFromTiles(imageId) {
         if (slot.imageId === imageId) {
           if (slot.state === "holding" || slot.state === "fadingIn") {
             slot.state = "fadingOut";
-            slot.pendingImage = images.length ? pickRandomImage(imageId) : null;
+            slot.pendingImage = images.length
+              ? pickImageForTile(tile, { excludeFace: f, alsoExcludeId: imageId })
+              : null;
           } else {
             clearFaceSlot(tile, f);
           }
@@ -944,34 +1015,110 @@ function removeImageFromTiles(imageId) {
   }
 }
 
-function pickRandomImage(excludeId = null) {
-  if (images.length === 0) return null;
-  if (images.length === 1) return images[0];
-  let pick = images[Math.floor(Math.random() * images.length)];
-  let guard = 0;
-  while (pick.id === excludeId && guard < 8) {
-    pick = images[Math.floor(Math.random() * images.length)];
-    guard++;
+/** Image ids currently on a cube (shown or pending), optionally ignoring one face. */
+function imagesOnTile(tile, excludeFace = -1) {
+  const ids = new Set();
+  for (let f = 0; f < 6; f++) {
+    if (f === excludeFace) continue;
+    const slot = tile.faceSlots[f];
+    if (slot.imageId != null) ids.add(slot.imageId);
+    if (slot.pendingImage?.id != null) ids.add(slot.pendingImage.id);
   }
-  return pick;
+  return ids;
 }
 
-function listActiveFaceRefs() {
+/** Global usage counts across active side faces (shown + pending). */
+function countImageUsage() {
+  const counts = new Map();
+  for (const img of images) counts.set(img.id, 0);
+  for (let i = 0; i < activeTileCount; i++) {
+    const tile = tiles[i];
+    for (const f of SIDE_FACES) {
+      const slot = tile.faceSlots[f];
+      if (slot.imageId != null && counts.has(slot.imageId)) {
+        counts.set(slot.imageId, counts.get(slot.imageId) + 1);
+      }
+      if (slot.pendingImage?.id != null && counts.has(slot.pendingImage.id)) {
+        counts.set(
+          slot.pendingImage.id,
+          counts.get(slot.pendingImage.id) + 1
+        );
+      }
+    }
+  }
+  return counts;
+}
+
+/**
+ * Pick an image for a face: avoid other faces on the same cube when possible,
+ * and prefer globally underused library images.
+ */
+function pickImageForTile(tile, { excludeFace = -1, alsoExcludeId = null } = {}) {
+  if (images.length === 0) return null;
+  if (images.length === 1) return images[0];
+
+  const onTile = imagesOnTile(tile, excludeFace);
+  if (alsoExcludeId != null) onTile.add(alsoExcludeId);
+
+  const usage = countImageUsage();
+  let candidates = images.filter((img) => !onTile.has(img.id));
+
+  // Last resort if the library is smaller than faces on the cube
+  if (candidates.length === 0) {
+    candidates = images.filter((img) => img.id !== alsoExcludeId);
+    if (candidates.length === 0) candidates = [...images];
+  }
+
+  let best = candidates[0];
+  let bestScore = Infinity;
+  for (const img of candidates) {
+    const used = usage.get(img.id) ?? 0;
+    const score = used + Math.random() * 0.35;
+    if (score < bestScore) {
+      bestScore = score;
+      best = img;
+    }
+  }
+  return best;
+}
+
+function listActiveSideFaceRefs() {
   const refs = [];
   for (let i = 0; i < activeTileCount; i++) {
     const tile = tiles[i];
-    for (let f = 0; f < 6; f++) {
+    for (const f of SIDE_FACES) {
       refs.push({ tile, face: f, slot: tile.faceSlots[f] });
     }
   }
   return refs;
 }
 
-/** Keep most cube faces in the rotation, preferring upright-capable side faces. */
+/** Clear any images that landed on top/bottom (never upright under Y-spin). */
+function clearTopBottomFaces() {
+  for (let i = 0; i < activeTileCount; i++) {
+    const tile = tiles[i];
+    for (const f of TOP_BOTTOM_FACES) {
+      const slot = tile.faceSlots[f];
+      if (slot.state === "empty" && !slot.pendingImage) continue;
+      if (slot.state === "holding" || slot.state === "fadingIn") {
+        slot.pendingImage = null;
+        slot.state = "fadingOut";
+      } else if (slot.state === "fadingOut") {
+        slot.pendingImage = null;
+      } else {
+        clearFaceSlot(tile, f);
+      }
+    }
+  }
+}
+
+/** Keep most side faces imaged; never place on top/bottom. */
 function ensureFaceCoverage(force = false) {
   if (images.length === 0) return;
 
-  const refs = listActiveFaceRefs();
+  clearTopBottomFaces();
+
+  const refs = listActiveSideFaceRefs();
   const busy = refs.filter((r) => r.slot.state !== "empty");
   const targetFilled = Math.max(1, Math.floor(refs.length * FACE_COVERAGE));
   let need = targetFilled - busy.length;
@@ -986,15 +1133,10 @@ function ensureFaceCoverage(force = false) {
       return scoreDiff + (Math.random() - 0.5) * 0.4;
     });
 
-  // Prefer side faces first; only use top/bottom if still under coverage
-  const sideEmpties = empties.filter((r) => SIDE_FACES.includes(r.face));
-  const otherEmpties = empties.filter((r) => !SIDE_FACES.includes(r.face));
-  const ordered = [...sideEmpties, ...otherEmpties];
-
-  const fillCount = Math.min(need, ordered.length);
+  const fillCount = Math.min(need, empties.length);
   for (let i = 0; i < fillCount; i++) {
-    const { tile, face } = ordered[i];
-    const image = pickRandomImage();
+    const { tile, face } = empties[i];
+    const image = pickImageForTile(tile, { excludeFace: face });
     if (image) beginFaceCycle(tile, face, image);
   }
 }
@@ -1016,6 +1158,7 @@ function updateFaceTransitions(dt, now) {
     const tile = tiles[i];
     for (let f = 0; f < 6; f++) {
       const slot = tile.faceSlots[f];
+      const isSide = SIDE_FACES.includes(f);
 
       if (slot.state === "fadingIn") {
         slot.fade = Math.min(1, slot.fade + dt * fadeSpeed);
@@ -1029,7 +1172,7 @@ function updateFaceTransitions(dt, now) {
           activeFades--;
         }
       } else if (slot.state === "holding") {
-        if (images.length === 0) {
+        if (!isSide || images.length === 0) {
           if (activeFades < MAX_ACTIVE_FADES) {
             slot.state = "fadingOut";
             slot.pendingImage = null;
@@ -1037,7 +1180,10 @@ function updateFaceTransitions(dt, now) {
           }
         } else if (now >= slot.holdUntil) {
           if (activeFades < MAX_ACTIVE_FADES) {
-            slot.pendingImage = pickRandomImage(slot.imageId);
+            slot.pendingImage = pickImageForTile(tile, {
+              excludeFace: f,
+              alsoExcludeId: slot.imageId,
+            });
             slot.state = "fadingOut";
             activeFades++;
           } else {
@@ -1051,11 +1197,16 @@ function updateFaceTransitions(dt, now) {
           slot.material.userData.imageMix.value = smoothstep(slot.fade);
         }
         if (slot.fade <= 0) {
-          let next = slot.pendingImage;
-          if (!next || !images.some((img) => img.id === next.id)) {
-            next = images.length ? pickRandomImage(slot.imageId) : null;
+          let next = isSide ? slot.pendingImage : null;
+          if (isSide && (!next || !images.some((img) => img.id === next.id))) {
+            next = images.length
+              ? pickImageForTile(tile, {
+                  excludeFace: f,
+                  alsoExcludeId: slot.imageId,
+                })
+              : null;
           }
-          if (next) {
+          if (next && isSide) {
             applyTextureToSlot(tile, f, next, { fadeIn: true });
           } else {
             clearFaceSlot(tile, f);
