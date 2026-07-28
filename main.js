@@ -58,11 +58,11 @@ const _spinAxis = new THREE.Vector3();
 const _tmpQuat = new THREE.Quaternion();
 
 const SHOWCASE_MAX_FEATURED = 3;
-// Swap motion speeds stay fixed — hold slider only changes time spent presenting
+// Swap motion speeds stay fixed — slider is seconds between cycling one cube
 const SHOWCASE_APPROACH_S = 1.35;
 const SHOWCASE_RETREAT_S = 1.2;
 const SHOWCASE_PRESENT_SCALE = 1.15;
-const SHOWCASE_HOLD_MIN_S = 1.5;
+const SHOWCASE_HOLD_MIN_S = 3;
 const SHOWCASE_HOLD_MAX_S = 12;
 // Spaced so featured cubes never overlap at present scale (centers ≥ ~2.1 apart)
 const SHOWCASE_PRESENT_SLOTS = [
@@ -75,7 +75,9 @@ const MAX_TILES = 52;
 const MIN_TILES = 8;
 const CUBE_SIZE = 0.72;
 const MIN_GAP = 0.42; // extra air gap beyond non-overlap spheres
-const FACE_COVERAGE = 0.82; // try to keep ~82% of active faces imaged
+const FACE_COVERAGE_SPARSE = 0.9; // when the library is tiny
+const PLENTY_IMAGES = 6; // at/above this, keep every face imaged
+const FACE_FILL_PER_TICK = 40; // refill empties gradually for GPU comfort
 const FADE_MS = 900; // smooth crossfade duration
 const MAX_TEX_SIZE = 512; // downscale library images for GPU
 const MAX_ACTIVE_FADES = 18; // limit simultaneous face fades per frame
@@ -85,7 +87,8 @@ let nextImageId = 1;
 let activePreset = "cluster";
 let activeTileCount = MAX_TILES;
 let dwellMs = 4000;
-let showcaseHoldS = 3.5;
+let showcaseHoldS = 4; // seconds between cycling one foreground cube
+let showcaseSwapTimer = 0;
 let coverageTimer = 0;
 let densityApplyTimer = 0;
 const PLACEHOLDER_CANVAS = (() => {
@@ -936,22 +939,24 @@ function layoutActiveTiles(preset = activePreset, { snap = false } = {}) {
 }
 
 function setShowcaseHoldSeconds(seconds) {
+  const prev = showcaseHoldS;
   showcaseHoldS = Math.max(
     SHOWCASE_HOLD_MIN_S,
-    Math.min(SHOWCASE_HOLD_MAX_S, Number(seconds) || 3.5)
+    Math.min(SHOWCASE_HOLD_MAX_S, Number(seconds) || 4)
   );
   if (showcaseHoldSlider) showcaseHoldSlider.value = String(showcaseHoldS);
   if (showcaseHoldValueEl) {
+    // e.g. 12s cycle → ~36s on screen with 3 foreground cubes
+    const onScreen = showcaseHoldS * SHOWCASE_MAX_FEATURED;
     showcaseHoldValueEl.textContent = `${showcaseHoldS.toFixed(1)}s`;
+    showcaseHoldSlider.title = `Cycle one cube every ${showcaseHoldS.toFixed(1)}s (~${onScreen.toFixed(0)}s on screen)`;
   }
-  // Remap hold for cubes already presenting — does not change approach/retreat speed
-  for (let i = 0; i < activeTileCount; i++) {
-    const tile = tiles[i];
-    if (tile.role !== "present") continue;
-    const remaining = Math.max(0.2, tile.roleDuration - tile.roleT);
-    const frac = Math.min(1, remaining / Math.max(0.2, tile.roleDuration));
-    tile.roleDuration = showcaseHoldS;
-    tile.roleT = showcaseHoldS * (1 - frac);
+  // Keep progress toward the next cycle proportional when the interval changes
+  if (prev > 1e-6) {
+    showcaseSwapTimer = Math.min(
+      showcaseHoldS,
+      showcaseSwapTimer * (showcaseHoldS / prev)
+    );
   }
 }
 
@@ -962,6 +967,7 @@ function syncShowcaseHoldVisibility() {
 
 function setPreset(id) {
   activePreset = id;
+  if (id === "showcase") showcaseSwapTimer = 0;
   layoutActiveTiles(id, { snap: false });
   [...presetListEl.querySelectorAll(".preset-btn")].forEach((btn) => {
     const on = btn.dataset.preset === id;
@@ -1316,17 +1322,20 @@ function listActiveFaceRefs() {
   return refs;
 }
 
-/** Keep most faces imaged; prefer camera-facing / upright-stable faces first. */
+function targetFaceFillCount(totalFaces) {
+  if (images.length === 0) return 0;
+  // Plenty of images → never leave a blank side
+  if (images.length >= PLENTY_IMAGES) return totalFaces;
+  // Still prefer full cubes once there are a few images (reuse allowed)
+  if (images.length >= 3) return totalFaces;
+  return Math.max(1, Math.floor(totalFaces * FACE_COVERAGE_SPARSE));
+}
+
+/** Keep faces imaged; with a decent library, fill every side (no blank faces). */
 function ensureFaceCoverage(force = false) {
   if (images.length === 0) return;
 
   const refs = listActiveFaceRefs();
-  const busy = refs.filter((r) => r.slot.state !== "empty");
-  const targetFilled = Math.max(1, Math.floor(refs.length * FACE_COVERAGE));
-  let need = targetFilled - busy.length;
-  if (!force && need <= 0) return;
-  if (force) need = Math.max(need, Math.floor(refs.length * 0.5));
-
   const empties = refs
     .filter((r) => r.slot.state === "empty")
     .sort((a, b) => {
@@ -1335,8 +1344,16 @@ function ensureFaceCoverage(force = false) {
       return scoreDiff + (Math.random() - 0.5) * 0.35;
     });
 
+  if (empties.length === 0) return;
+
+  const busy = refs.length - empties.length;
+  const targetFilled = targetFaceFillCount(refs.length);
+  let need = targetFilled - busy;
+  if (!force && need <= 0) return;
+  if (force) need = Math.max(need, empties.length);
+
   const usage = countImageUsage();
-  const fillCount = Math.min(need, empties.length);
+  const fillCount = Math.min(need, empties.length, FACE_FILL_PER_TICK);
   for (let i = 0; i < fillCount; i++) {
     const { tile, face } = empties[i];
     const image = pickImageForTile(tile, { excludeFace: face, usage });
@@ -1408,6 +1425,10 @@ function updateFaceTransitions(dt, now) {
                 })
               : null;
           }
+          // With a library available, never land on a blank face
+          if (!next && images.length > 0) {
+            next = pickImageForTile(tile, { excludeFace: f });
+          }
           if (next) {
             applyTextureToSlot(tile, f, next, { fadeIn: true });
           } else {
@@ -1457,9 +1478,9 @@ function beginShowcaseRetreat(tile) {
 
 /**
  * Showcase choreography:
- * - Up to 3 cubes hold in spaced foreground slots
- * - Hold slider = how long they stay (not swap motion speed)
- * - Only one approach OR retreat runs at a time
+ * - Up to 3 cubes in spaced foreground slots
+ * - Slider = seconds between cycling ONE cube (×3 ≈ time each stays on screen)
+ * - Approach/retreat speed is fixed; only one transition at a time
  */
 function updateShowcase(dt, t) {
   const usedSlots = new Set();
@@ -1486,13 +1507,11 @@ function updateShowcase(dt, t) {
     }
   }
 
-  const transitioning = !!(approaching || retreating);
-
-  // Finish approach → present (hold duration from slider only)
+  // Finish approach → present (roleT tracks on-screen age for oldest-first cycling)
   if (approaching && approaching.roleT >= approaching.roleDuration) {
     approaching.role = "present";
     approaching.roleT = 0;
-    approaching.roleDuration = showcaseHoldS;
+    approaching.roleDuration = Infinity;
     presenting.push(approaching);
     approaching = null;
   }
@@ -1506,13 +1525,10 @@ function updateShowcase(dt, t) {
     retreating = null;
   }
 
-  // Only one swap motion at a time. Fill empty foreground slots first, then rotate out.
+  // Only one swap motion at a time. Fill empty slots first, then cycle on an interval.
   if (!approaching && !retreating) {
-    const expired = presenting
-      .filter((tile) => tile.roleT >= tile.roleDuration)
-      .sort((a, b) => b.roleT - a.roleT);
-
     if (presenting.length < SHOWCASE_MAX_FEATURED) {
+      showcaseSwapTimer = 0;
       const tile = pickRandomShowcaseCandidate(readyIdle);
       if (tile) {
         let slotIndex = 0;
@@ -1523,8 +1539,14 @@ function updateShowcase(dt, t) {
           beginShowcaseApproach(tile, slotIndex);
         }
       }
-    } else if (expired.length > 0) {
-      beginShowcaseRetreat(expired[0]);
+    } else {
+      // Full foreground: cycle the oldest cube every showcaseHoldS seconds
+      showcaseSwapTimer += dt;
+      if (showcaseSwapTimer >= showcaseHoldS) {
+        showcaseSwapTimer = 0;
+        const oldest = [...presenting].sort((a, b) => b.roleT - a.roleT)[0];
+        if (oldest) beginShowcaseRetreat(oldest);
+      }
     }
   }
 
@@ -1773,9 +1795,11 @@ function animate() {
   updateFaceTransitions(dt, now);
 
   coverageTimer += dt;
-  if (coverageTimer >= 1.25) {
+  // Refill blank faces quickly when the library can cover them
+  const coverageInterval = images.length >= PLENTY_IMAGES ? 0.45 : 1.25;
+  if (coverageTimer >= coverageInterval) {
     coverageTimer = 0;
-    ensureFaceCoverage(false);
+    ensureFaceCoverage(images.length >= PLENTY_IMAGES);
   }
 
   if (activePreset === "showcase") {
