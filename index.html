@@ -22,92 +22,118 @@
       <h1>Tile Field</h1>
     </header>
 
-    <aside class="panel panel-left" aria-label="Library and motion controls">
-      <section class="panel-section">
-        <div class="panel-heading">
-          <h2>Library</h2>
-          <button type="button" id="clear-all" class="ghost-btn" disabled>Clear all</button>
-        </div>
-        <ul id="image-list" class="image-list">
-          <li class="empty-state">Drop images to begin</li>
-        </ul>
-      </section>
-
-      <section class="panel-section">
-        <h2>Motion</h2>
-        <div id="preset-list" class="preset-list" role="listbox" aria-label="Motion presets"></div>
-      </section>
-
-      <section class="panel-section">
-        <h2>Controls</h2>
-        <label class="slider-row" for="density-slider">
-          <span class="slider-label">
-            Density
-            <span id="density-value" class="slider-value">52</span>
+    <aside id="controls-panel" class="panel" aria-label="Library and controls">
+      <div class="panel-chrome">
+        <button
+          type="button"
+          id="panel-toggle"
+          class="panel-toggle"
+          aria-expanded="true"
+          aria-controls="panel-body"
+          title="Collapse panel"
+        >
+          <span class="panel-toggle-label">Controls</span>
+          <span class="panel-toggle-icon" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none">
+              <path
+                d="M3.5 5.25L7 8.75L10.5 5.25"
+                stroke="currentColor"
+                stroke-width="1.6"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+              />
+            </svg>
           </span>
-          <input
-            id="density-slider"
-            type="range"
-            min="8"
-            max="52"
-            value="52"
-            step="1"
-          />
-        </label>
-        <label class="slider-row" for="dwell-slider">
-          <span class="slider-label">
-            Image hold
-            <span id="dwell-value" class="slider-value">4.0s</span>
-          </span>
-          <input
-            id="dwell-slider"
-            type="range"
-            min="1"
-            max="12"
-            value="4"
-            step="0.5"
-          />
-        </label>
-        <label class="slider-row color-row" for="cube-color">
-          <span class="slider-label">
-            Cube color
-            <span id="cube-color-value" class="slider-value">#10131c</span>
-          </span>
-          <input id="cube-color" type="color" value="#10131c" />
-        </label>
-      </section>
-    </aside>
-
-    <aside class="panel panel-right" aria-label="Add images">
-      <div
-        id="drop-zone"
-        class="drop-zone"
-        tabindex="0"
-        role="button"
-        aria-label="Drag and drop images here, or click to browse"
-      >
-        <input
-          id="file-input"
-          type="file"
-          accept="image/*"
-          multiple
-          hidden
-        />
-        <div class="drop-icon" aria-hidden="true">
-          <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-            <path
-              d="M14 5v12m0 0l-4.5-4.5M14 17l4.5-4.5M5 21.5h18"
-              stroke="currentColor"
-              stroke-width="1.6"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-            />
-          </svg>
-        </div>
-        <p class="drop-title">Drop images</p>
-        <p class="drop-hint">or click to browse · PNG, JPG, WEBP</p>
+        </button>
       </div>
-      <p class="status" id="status">Images cycle across cube faces over time</p>
+
+      <div id="panel-body" class="panel-body">
+        <section class="panel-section">
+          <div
+            id="drop-zone"
+            class="drop-zone"
+            tabindex="0"
+            role="button"
+            aria-label="Drag and drop images here, or click to browse"
+          >
+            <input
+              id="file-input"
+              type="file"
+              accept="image/*"
+              multiple
+              hidden
+            />
+            <div class="drop-icon" aria-hidden="true">
+              <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+                <path
+                  d="M14 5v12m0 0l-4.5-4.5M14 17l4.5-4.5M5 21.5h18"
+                  stroke="currentColor"
+                  stroke-width="1.6"
+                  stroke-linecap="round"
+                  stroke-linejoin="round"
+                />
+              </svg>
+            </div>
+            <p class="drop-title">Drop images</p>
+            <p class="drop-hint">or click to browse · PNG, JPG, WEBP</p>
+          </div>
+          <p class="status" id="status">Images cycle across cube faces over time</p>
+        </section>
+
+        <section class="panel-section">
+          <div class="panel-heading">
+            <h2>Library</h2>
+            <button type="button" id="clear-all" class="ghost-btn" disabled>Clear all</button>
+          </div>
+          <ul id="image-list" class="image-list">
+            <li class="empty-state">Drop images to begin</li>
+          </ul>
+        </section>
+
+        <section class="panel-section">
+          <h2>Motion</h2>
+          <div id="preset-list" class="preset-list" role="listbox" aria-label="Motion presets"></div>
+        </section>
+
+        <section class="panel-section">
+          <h2>Controls</h2>
+          <label class="slider-row" for="density-slider">
+            <span class="slider-label">
+              Density
+              <span id="density-value" class="slider-value">52</span>
+            </span>
+            <input
+              id="density-slider"
+              type="range"
+              min="8"
+              max="52"
+              value="52"
+              step="1"
+            />
+          </label>
+          <label class="slider-row" for="dwell-slider">
+            <span class="slider-label">
+              Image hold
+              <span id="dwell-value" class="slider-value">4.0s</span>
+            </span>
+            <input
+              id="dwell-slider"
+              type="range"
+              min="1"
+              max="12"
+              value="4"
+              step="0.5"
+            />
+          </label>
+          <label class="slider-row color-row" for="cube-color">
+            <span class="slider-label">
+              Cube color
+              <span id="cube-color-value" class="slider-value">#10131c</span>
+            </span>
+            <input id="cube-color" type="color" value="#10131c" />
+          </label>
+        </section>
+      </div>
     </aside>
 
     <script type="importmap">
@@ -118,6 +144,6 @@
         }
       }
     </script>
-    <script type="module" src="main.js?v=13"></script>
+    <script type="module" src="main.js?v=15"></script>
   </body>
 </html>

@@ -2,6 +2,8 @@ import * as THREE from "three";
 import { RoundedBoxGeometry } from "three/addons/geometries/RoundedBoxGeometry.js";
 
 const canvas = document.getElementById("scene");
+const controlsPanel = document.getElementById("controls-panel");
+const panelToggle = document.getElementById("panel-toggle");
 const dropZone = document.getElementById("drop-zone");
 const fileInput = document.getElementById("file-input");
 const imageListEl = document.getElementById("image-list");
@@ -24,7 +26,20 @@ const PRESETS = [
   { id: "helix", label: "Helix" },
   { id: "grid", label: "Grid" },
   { id: "scatter", label: "Scatter" },
+  { id: "showcase", label: "Showcase" },
+  { id: "depth", label: "Depth Field" },
 ];
+
+// Box face order: +X, -X, +Y, -Y, +Z, -Z — prefer sides for upright Y-spin
+const SIDE_FACES = [0, 1, 4, 5];
+const FACE_TEX_ROTATION = [0, Math.PI, 0, Math.PI, 0, Math.PI];
+
+const SHOWCASE_MAX_FEATURED = 3;
+const SHOWCASE_APPROACH_S = 1.35;
+const SHOWCASE_PRESENT_S = 3.2;
+const SHOWCASE_RETREAT_S = 1.2;
+const SHOWCASE_PRESENT_Z = 4.6;
+const SHOWCASE_PRESENT_SCALE = 1.05;
 
 const MAX_TILES = 52;
 const MIN_TILES = 8;
@@ -133,6 +148,11 @@ function makeBaseMaterial() {
 }
 
 const sharedBaseMaterial = makeBaseMaterial();
+const sharedBgMaterial = makeBaseMaterial();
+sharedBgMaterial.color.multiplyScalar(0.55);
+sharedBgMaterial.envMapIntensity = 0.35;
+sharedBgMaterial.roughness = 0.55;
+sharedBgMaterial.metalness = 0.7;
 
 function boundingRadius(scale) {
   // Sphere that fully contains a cube of side CUBE_SIZE at the given scale
@@ -185,6 +205,20 @@ function buildAllTargets(preset, count) {
   const targets = [];
   for (let i = 0; i < count; i++) {
     targets.push(getTargets(preset, i, count));
+  }
+  if (preset === "depth") {
+    separateTargets(
+      targets.filter((t) => t.layer === "fg"),
+      28
+    );
+    separateTargets(
+      targets.filter((t) => t.layer === "bg"),
+      28
+    );
+    return targets;
+  }
+  if (preset === "showcase") {
+    return separateTargets(targets, 20);
   }
   return separateTargets(targets);
 }
@@ -261,6 +295,15 @@ function ensureImageTexture(image) {
   img.onload = () => {
     texture.image = downscaleImageElement(img, MAX_TEX_SIZE);
     texture.needsUpdate = true;
+    // Oriented per-face clones share the image pixels — refresh them
+    for (const tile of tiles) {
+      for (const slot of tile.faceSlots) {
+        if (slot.imageId === image.id && slot.orientedTexture) {
+          slot.orientedTexture.image = texture.image;
+          slot.orientedTexture.needsUpdate = true;
+        }
+      }
+    }
   };
   img.onerror = () => {
     console.warn("Failed to load texture", image.name);
@@ -271,10 +314,17 @@ function ensureImageTexture(image) {
 }
 
 function disposeImageTexture(image) {
-  if (image?.texture) {
-    image.texture.dispose();
-    image.texture = null;
+  if (!image?.texture) return;
+  for (const tile of tiles) {
+    for (const slot of tile.faceSlots) {
+      if (slot.imageId === image.id && slot.orientedTexture) {
+        slot.orientedTexture.dispose();
+        slot.orientedTexture = null;
+      }
+    }
   }
+  image.texture.dispose();
+  image.texture = null;
 }
 
 function setCubeColor(hex) {
@@ -284,9 +334,18 @@ function setCubeColor(hex) {
   cubeColorValueEl.textContent = label;
 
   sharedBaseMaterial.color.copy(cubeColor);
+  sharedBgMaterial.color.copy(cubeColor).multiplyScalar(0.55);
   for (const tile of tiles) {
     for (const slot of tile.faceSlots) {
-      if (slot.material) slot.material.color.copy(cubeColor);
+      if (slot.material) {
+        slot.material.color.copy(cubeColor);
+        if (tile.layer === "bg" && activePreset === "depth") {
+          slot.material.color.multiplyScalar(0.65);
+          slot.material.envMapIntensity = 0.35;
+        } else {
+          slot.material.envMapIntensity = 0.65;
+        }
+      }
     }
   }
 }
@@ -451,6 +510,68 @@ function buildScatterTargets(i) {
   };
 }
 
+/** Idle field for Showcase — mid/back depth; choreography advances tiles forward. */
+function buildShowcaseTargets(i, count) {
+  const cols = Math.ceil(Math.sqrt(count * 1.35));
+  const rows = Math.ceil(count / cols);
+  const col = i % cols;
+  const row = Math.floor(i / cols);
+  const spacing = minCenterDistance(0.72, 0.72) * 1.05;
+  const x = (col - (cols - 1) / 2) * spacing + (seededNoise(i, 41) - 0.5) * 0.35;
+  const y = (row - (rows - 1) / 2) * spacing * 0.85 + (seededNoise(i, 42) - 0.5) * 0.3;
+  const z = -1.2 + seededNoise(i, 43) * 2.4;
+  return {
+    position: new THREE.Vector3(x, y, z),
+    rotation: new THREE.Euler(0, seededNoise(i, 44) * Math.PI * 2, 0),
+    scale: 0.7 + seededNoise(i, 45) * 0.15,
+    layer: "bg",
+  };
+}
+
+/** Two-layer floating grids: ~60% foreground, ~40% soft background. */
+function buildDepthTargets(i, count) {
+  const fgCount = Math.max(1, Math.ceil(count * 0.6));
+  if (i < fgCount) {
+    const cols = Math.ceil(Math.sqrt(fgCount * 1.45));
+    const rows = Math.ceil(fgCount / cols);
+    const col = i % cols;
+    const row = Math.floor(i / cols);
+    const spacing = minCenterDistance(0.9, 0.9) * 1.08;
+    return {
+      position: new THREE.Vector3(
+        (col - (cols - 1) / 2) * spacing,
+        (row - (rows - 1) / 2) * spacing * 0.92,
+        2.4 + (seededNoise(i, 50) - 0.5) * 0.85
+      ),
+      rotation: new THREE.Euler(
+        (seededNoise(i, 51) - 0.5) * 0.12,
+        (seededNoise(i, 52) - 0.5) * 0.35,
+        (seededNoise(i, 53) - 0.5) * 0.08
+      ),
+      scale: 0.88 + seededNoise(i, 54) * 0.1,
+      layer: "fg",
+    };
+  }
+
+  const bi = i - fgCount;
+  const bgCount = Math.max(1, count - fgCount);
+  const cols = Math.ceil(Math.sqrt(bgCount * 1.6));
+  const rows = Math.ceil(bgCount / cols);
+  const col = bi % cols;
+  const row = Math.floor(bi / cols);
+  const spacing = minCenterDistance(0.55, 0.55) * 1.15;
+  return {
+    position: new THREE.Vector3(
+      (col - (cols - 1) / 2) * spacing * 1.15,
+      (row - (rows - 1) / 2) * spacing,
+      -3.2 + (seededNoise(i, 55) - 0.5) * 1.2
+    ),
+    rotation: new THREE.Euler(0, (seededNoise(i, 56) - 0.5) * 0.5, 0),
+    scale: 0.48 + seededNoise(i, 57) * 0.12,
+    layer: "bg",
+  };
+}
+
 function getTargets(preset, i, count) {
   switch (preset) {
     case "orbit":
@@ -467,6 +588,10 @@ function getTargets(preset, i, count) {
       return buildGridTargets(i, count);
     case "scatter":
       return buildScatterTargets(i);
+    case "showcase":
+      return buildShowcaseTargets(i, count);
+    case "depth":
+      return buildDepthTargets(i, count);
     case "cluster":
     default:
       return buildClusterTargets(i, count);
@@ -498,6 +623,7 @@ for (let i = 0; i < MAX_TILES; i++) {
   const faceSlots = Array.from({ length: 6 }, () => ({
     imageId: null,
     material: null,
+    orientedTexture: null,
     fade: 0,
     state: "empty", // empty | fadingIn | holding | fadingOut
     holdUntil: 0,
@@ -508,12 +634,22 @@ for (let i = 0; i < MAX_TILES; i++) {
     mesh,
     index: i,
     active: true,
+    layer: target.layer || "fg",
+    role: "idle", // showcase: idle | approach | present | retreat
+    roleT: 0,
+    roleDuration: 1,
+    presentAnchor: new THREE.Vector3(),
     phase: seededNoise(i, 20) * Math.PI * 2,
     spin: new THREE.Vector3(
       (seededNoise(i, 21) - 0.5) * 0.4,
       (seededNoise(i, 22) - 0.5) * 0.55,
       (seededNoise(i, 23) - 0.5) * 0.35
     ),
+    home: {
+      position: target.position.clone(),
+      rotation: target.rotation.clone(),
+      scale: target.scale,
+    },
     current: {
       position: target.position.clone(),
       rotation: target.rotation.clone(),
@@ -528,6 +664,50 @@ for (let i = 0; i < MAX_TILES; i++) {
   });
 }
 
+function emptyFaceMaterial(tile) {
+  return tile.layer === "bg" && activePreset === "depth"
+    ? sharedBgMaterial
+    : sharedBaseMaterial;
+}
+
+function applySpinForPreset(tile, preset) {
+  if (preset === "showcase" || preset === "depth") {
+    // Y-dominant spin keeps side-face images upright while turning
+    const dir = seededNoise(tile.index, 22) > 0.5 ? 1 : -1;
+    tile.spin.set(
+      (seededNoise(tile.index, 21) - 0.5) * 0.05,
+      dir * (0.28 + seededNoise(tile.index, 24) * 0.2),
+      (seededNoise(tile.index, 23) - 0.5) * 0.04
+    );
+  } else {
+    tile.spin.set(
+      (seededNoise(tile.index, 21) - 0.5) * 0.4,
+      (seededNoise(tile.index, 22) - 0.5) * 0.55,
+      (seededNoise(tile.index, 23) - 0.5) * 0.35
+    );
+  }
+}
+
+function syncTileLayerMaterials(tile) {
+  const emptyMat = emptyFaceMaterial(tile);
+  for (let f = 0; f < 6; f++) {
+    const slot = tile.faceSlots[f];
+    if (slot.state === "empty" || !slot.material) {
+      tile.mesh.material[f] = emptyMat;
+    } else if (slot.material) {
+      if (tile.layer === "bg" && activePreset === "depth") {
+        slot.material.color.copy(cubeColor).multiplyScalar(0.65);
+        slot.material.envMapIntensity = 0.35;
+        slot.material.roughness = 0.5;
+      } else {
+        slot.material.color.copy(cubeColor);
+        slot.material.envMapIntensity = 0.65;
+        slot.material.roughness = 0.4;
+      }
+    }
+  }
+}
+
 function layoutActiveTiles(preset = activePreset, { snap = false } = {}) {
   const nextTargets = buildAllTargets(preset, activeTileCount);
   for (let i = 0; i < tiles.length; i++) {
@@ -536,9 +716,24 @@ function layoutActiveTiles(preset = activePreset, { snap = false } = {}) {
       const next = nextTargets[i];
       tile.active = true;
       tile.mesh.visible = true;
+      tile.layer = next.layer || "fg";
       tile.target.position.copy(next.position);
       tile.target.rotation.copy(next.rotation);
       tile.target.scale = next.scale;
+      tile.home.position.copy(next.position);
+      tile.home.rotation.copy(next.rotation);
+      tile.home.scale = next.scale;
+      applySpinForPreset(tile, preset);
+
+      if (preset === "showcase") {
+        tile.role = "idle";
+        tile.roleT = 0;
+        tile.roleDuration = 0.6 + seededNoise(i, 60) * 4.5;
+      } else {
+        tile.role = "idle";
+        tile.roleT = 0;
+      }
+
       if (snap) {
         tile.current.position.copy(next.position);
         tile.current.rotation.copy(next.rotation);
@@ -547,9 +742,11 @@ function layoutActiveTiles(preset = activePreset, { snap = false } = {}) {
         tile.mesh.rotation.copy(next.rotation);
         tile.mesh.scale.setScalar(next.scale);
       }
+      syncTileLayerMaterials(tile);
     } else {
       tile.active = false;
       tile.mesh.visible = false;
+      tile.role = "idle";
       for (let f = 0; f < 6; f++) clearFaceSlot(tile, f);
     }
   }
@@ -628,7 +825,7 @@ function clearFaceSlot(tile, faceIndex) {
   if (slot.material) {
     slot.material.userData.imageMix.value = 0;
   }
-  tile.mesh.material[faceIndex] = sharedBaseMaterial;
+  tile.mesh.material[faceIndex] = emptyFaceMaterial(tile);
   slot.imageId = null;
   slot.fade = 0;
   slot.state = "empty";
@@ -636,19 +833,44 @@ function clearFaceSlot(tile, faceIndex) {
   slot.pendingImage = null;
 }
 
+function ensureOrientedTexture(slot, faceIndex, baseTexture) {
+  if (!slot.orientedTexture) {
+    slot.orientedTexture = baseTexture.clone();
+    slot.orientedTexture.colorSpace = THREE.SRGBColorSpace;
+    slot.orientedTexture.wrapS = THREE.ClampToEdgeWrapping;
+    slot.orientedTexture.wrapT = THREE.ClampToEdgeWrapping;
+    slot.orientedTexture.center.set(0.5, 0.5);
+    slot.orientedTexture.anisotropy = baseTexture.anisotropy;
+  }
+  slot.orientedTexture.image = baseTexture.image;
+  slot.orientedTexture.rotation = FACE_TEX_ROTATION[faceIndex] ?? 0;
+  slot.orientedTexture.needsUpdate = true;
+  return slot.orientedTexture;
+}
+
 function applyTextureToSlot(tile, faceIndex, image, { fadeIn = true, holdJitter = true } = {}) {
   const slot = tile.faceSlots[faceIndex];
-  const texture = ensureImageTexture(image);
+  const baseTexture = ensureImageTexture(image);
+  const texture = ensureOrientedTexture(slot, faceIndex, baseTexture);
 
   if (!slot.material) {
     slot.material = makeImageMaterial(texture);
   } else {
     slot.material.map = texture;
-    slot.material.color.copy(cubeColor);
     slot.material.needsUpdate = true;
   }
 
   const mat = slot.material;
+  if (tile.layer === "bg" && activePreset === "depth") {
+    mat.color.copy(cubeColor).multiplyScalar(0.65);
+    mat.envMapIntensity = 0.35;
+    mat.roughness = 0.5;
+  } else {
+    mat.color.copy(cubeColor);
+    mat.envMapIntensity = 0.65;
+    mat.roughness = 0.4;
+  }
+
   slot.imageId = image.id;
   slot.pendingImage = null;
   tile.mesh.material[faceIndex] = mat;
@@ -665,6 +887,25 @@ function applyTextureToSlot(tile, faceIndex, image, { fadeIn = true, holdJitter 
     const jitter = holdJitter ? 0.25 + Math.random() * 0.9 : 1;
     slot.holdUntil = performance.now() + dwellMs * jitter;
   }
+}
+
+/** Higher = better candidate for upright-looking placement. */
+function faceUprightScore(faceIndex, tile) {
+  const isSide = SIDE_FACES.includes(faceIndex);
+  let score = isSide ? 12 : 1;
+
+  const ax = Math.abs(tile.spin.x);
+  const ay = Math.abs(tile.spin.y);
+  const az = Math.abs(tile.spin.z);
+  const yDom = ay / (ax + ay + az + 1e-6);
+  score += isSide ? yDom * 5 : -yDom * 4;
+
+  if (tile.role === "present" || tile.role === "approach") score += 6;
+  if (tile.layer === "fg") score += 3;
+  if (tile.layer === "bg" && activePreset === "depth") score -= 1;
+
+  score += tile.current.position.z * 0.45;
+  return score;
 }
 
 function beginFaceCycle(tile, faceIndex, image) {
@@ -726,7 +967,7 @@ function listActiveFaceRefs() {
   return refs;
 }
 
-/** Keep most cube faces in the rotation, preferring empties / least-recent. */
+/** Keep most cube faces in the rotation, preferring upright-capable side faces. */
 function ensureFaceCoverage(force = false) {
   if (images.length === 0) return;
 
@@ -739,11 +980,20 @@ function ensureFaceCoverage(force = false) {
 
   const empties = refs
     .filter((r) => r.slot.state === "empty")
-    .sort(() => Math.random() - 0.5);
+    .sort((a, b) => {
+      const scoreDiff =
+        faceUprightScore(b.face, b.tile) - faceUprightScore(a.face, a.tile);
+      return scoreDiff + (Math.random() - 0.5) * 0.4;
+    });
 
-  const fillCount = Math.min(need, empties.length);
+  // Prefer side faces first; only use top/bottom if still under coverage
+  const sideEmpties = empties.filter((r) => SIDE_FACES.includes(r.face));
+  const otherEmpties = empties.filter((r) => !SIDE_FACES.includes(r.face));
+  const ordered = [...sideEmpties, ...otherEmpties];
+
+  const fillCount = Math.min(need, ordered.length);
   for (let i = 0; i < fillCount; i++) {
-    const { tile, face } = empties[i];
+    const { tile, face } = ordered[i];
     const image = pickRandomImage();
     if (image) beginFaceCycle(tile, face, image);
   }
@@ -822,6 +1072,96 @@ function smoothstep(t) {
   return x * x * (3 - 2 * x);
 }
 
+/** Choreograph tiles: idle field → approach → present/spin → retreat. */
+function updateShowcase(dt, t) {
+  let featured = 0;
+  for (let i = 0; i < activeTileCount; i++) {
+    if (tiles[i].role !== "idle") featured++;
+  }
+
+  for (let i = 0; i < activeTileCount; i++) {
+    const tile = tiles[i];
+    tile.roleT += dt;
+
+    if (tile.role === "idle") {
+      if (tile.roleT >= tile.roleDuration && featured < SHOWCASE_MAX_FEATURED) {
+        tile.role = "approach";
+        tile.roleT = 0;
+        tile.roleDuration = SHOWCASE_APPROACH_S;
+        tile.presentAnchor.set(
+          tile.home.position.x * 0.55 + (seededNoise(i, 70) - 0.5) * 0.8,
+          tile.home.position.y * 0.5 + (seededNoise(i, 71) - 0.5) * 0.6,
+          SHOWCASE_PRESENT_Z
+        );
+        featured++;
+      } else {
+        tile.target.position.copy(tile.home.position);
+        tile.target.rotation.copy(tile.home.rotation);
+        tile.target.scale = tile.home.scale;
+        continue;
+      }
+    }
+
+    if (tile.role === "approach") {
+      const u = smoothstep(Math.min(1, tile.roleT / tile.roleDuration));
+      tile.target.position.lerpVectors(tile.home.position, tile.presentAnchor, u);
+      tile.target.scale = THREE.MathUtils.lerp(
+        tile.home.scale,
+        SHOWCASE_PRESENT_SCALE,
+        u
+      );
+      tile.target.rotation.set(
+        tile.home.rotation.x * (1 - u),
+        tile.home.rotation.y + u * 0.4,
+        tile.home.rotation.z * (1 - u)
+      );
+      if (tile.roleT >= tile.roleDuration) {
+        tile.role = "present";
+        tile.roleT = 0;
+        tile.roleDuration = SHOWCASE_PRESENT_S + seededNoise(i, 61) * 1.4;
+      }
+      continue;
+    }
+
+    if (tile.role === "present") {
+      tile.target.position.set(
+        tile.presentAnchor.x + Math.sin(t * 0.7 + tile.phase) * 0.08,
+        tile.presentAnchor.y + Math.cos(t * 0.55 + tile.phase) * 0.1,
+        SHOWCASE_PRESENT_Z
+      );
+      tile.target.scale = SHOWCASE_PRESENT_SCALE;
+      tile.target.rotation.set(0.05, tile.home.rotation.y, 0);
+      if (tile.roleT >= tile.roleDuration) {
+        tile.role = "retreat";
+        tile.roleT = 0;
+        tile.roleDuration = SHOWCASE_RETREAT_S;
+      }
+      continue;
+    }
+
+    if (tile.role === "retreat") {
+      const u = smoothstep(Math.min(1, tile.roleT / tile.roleDuration));
+      tile.target.position.lerpVectors(tile.presentAnchor, tile.home.position, u);
+      tile.target.scale = THREE.MathUtils.lerp(
+        SHOWCASE_PRESENT_SCALE,
+        tile.home.scale,
+        u
+      );
+      tile.target.rotation.x = THREE.MathUtils.lerp(0.05, tile.home.rotation.x, u);
+      tile.target.rotation.y = tile.home.rotation.y;
+      tile.target.rotation.z = THREE.MathUtils.lerp(0, tile.home.rotation.z, u);
+      if (tile.roleT >= tile.roleDuration) {
+        tile.role = "idle";
+        tile.roleT = 0;
+        tile.roleDuration = 1.8 + seededNoise(i, 62) * 5.5;
+        tile.target.position.copy(tile.home.position);
+        tile.target.rotation.copy(tile.home.rotation);
+        tile.target.scale = tile.home.scale;
+      }
+    }
+  }
+}
+
 function seedFacesFromLibrary() {
   ensureFaceCoverage(true);
 }
@@ -879,6 +1219,16 @@ function clearAll() {
 }
 
 // UI wiring
+function setPanelCollapsed(collapsed) {
+  controlsPanel.classList.toggle("collapsed", collapsed);
+  panelToggle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+  panelToggle.title = collapsed ? "Expand panel" : "Collapse panel";
+}
+
+panelToggle.addEventListener("click", () => {
+  setPanelCollapsed(!controlsPanel.classList.contains("collapsed"));
+});
+
 PRESETS.forEach((preset) => {
   const btn = document.createElement("button");
   btn.type = "button";
@@ -995,23 +1345,42 @@ function animate() {
     ensureFaceCoverage(false);
   }
 
+  if (activePreset === "showcase") {
+    updateShowcase(dt, t);
+  }
+
   // Global group motion varies by preset
   const breathe = Math.sin(t * 0.35) * 0.04;
-  root.rotation.y = t * (activePreset === "orbit" ? 0.22 : activePreset === "cluster" ? 0.12 : 0.08);
-  root.rotation.x = Math.sin(t * 0.18) * 0.08 + breathe;
-  root.position.y = Math.sin(t * 0.4) * 0.12;
+  if (activePreset === "showcase") {
+    root.rotation.y = t * 0.035;
+    root.rotation.x = Math.sin(t * 0.14) * 0.04 + breathe * 0.5;
+    root.position.y = Math.sin(t * 0.3) * 0.06;
+  } else if (activePreset === "depth") {
+    root.rotation.y = Math.sin(t * 0.12) * 0.1;
+    root.rotation.x = Math.sin(t * 0.16) * 0.05 + breathe * 0.6;
+    root.position.y = Math.sin(t * 0.35) * 0.1;
+  } else {
+    root.rotation.y =
+      t *
+      (activePreset === "orbit" ? 0.22 : activePreset === "cluster" ? 0.12 : 0.08);
+    root.rotation.x = Math.sin(t * 0.18) * 0.08 + breathe;
+    root.position.y = Math.sin(t * 0.4) * 0.12;
+  }
 
   wobbleScale =
     activePreset === "scatter"
       ? 0.7
-      : activePreset === "wave"
+      : activePreset === "wave" || activePreset === "depth"
         ? 0.55
-        : activePreset === "cluster"
-          ? 0.25
-          : 0.4;
+        : activePreset === "showcase"
+          ? 0.3
+          : activePreset === "cluster"
+            ? 0.25
+            : 0.4;
 
   const settle = 1 - Math.exp(-dt * 2.4);
-  const spinMul = activePreset === "grid" ? 0.15 : 1;
+  const baseSpinMul =
+    activePreset === "grid" ? 0.15 : activePreset === "depth" ? 0.45 : 1;
 
   for (let i = 0; i < activeTileCount; i++) {
     const tile = tiles[i];
@@ -1023,9 +1392,15 @@ function animate() {
     tile.current.rotation.y += (tile.target.rotation.y - tile.current.rotation.y) * settle;
     tile.current.rotation.z += (tile.target.rotation.z - tile.current.rotation.z) * settle;
 
-    const ox = Math.sin(t * 0.7 + tile.phase) * 0.02 * wobbleScale;
-    const oy = Math.cos(t * 0.55 + tile.phase * 1.3) * 0.025 * wobbleScale;
-    const oz = Math.sin(t * 0.4 + tile.phase * 0.7) * 0.015 * wobbleScale;
+    let localWobble = wobbleScale;
+    if (activePreset === "depth" && tile.layer === "fg") localWobble = 0.7;
+    if (activePreset === "depth" && tile.layer === "bg") localWobble = 0.35;
+    if (activePreset === "showcase" && tile.role === "present") localWobble = 0.15;
+    if (activePreset === "showcase" && tile.role === "idle") localWobble = 0.4;
+
+    const ox = Math.sin(t * 0.7 + tile.phase) * 0.02 * localWobble;
+    const oy = Math.cos(t * 0.55 + tile.phase * 1.3) * 0.025 * localWobble;
+    const oz = Math.sin(t * 0.4 + tile.phase * 0.7) * 0.015 * localWobble;
 
     tile.mesh.position.set(
       tile.current.position.x + ox,
@@ -1033,6 +1408,16 @@ function animate() {
       tile.current.position.z + oz
     );
     tile.mesh.scale.setScalar(tile.current.scale);
+
+    let spinMul = baseSpinMul;
+    if (activePreset === "showcase") {
+      spinMul =
+        tile.role === "present"
+          ? 1.15
+          : tile.role === "approach" || tile.role === "retreat"
+            ? 0.65
+            : 0.28;
+    }
 
     tmpEuler.set(
       tile.current.rotation.x + t * tile.spin.x * spinMul,
