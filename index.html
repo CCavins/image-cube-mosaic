@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="styles.css?v=20" />
+    <link rel="stylesheet" href="styles.css?v=22" />
   </head>
   <body>
     <canvas id="scene"></canvas>
@@ -125,6 +125,25 @@
               step="0.5"
             />
           </label>
+          <label
+            class="slider-row"
+            for="showcase-hold-slider"
+            id="showcase-hold-row"
+            hidden
+          >
+            <span class="slider-label">
+              Showcase duration
+              <span id="showcase-hold-value" class="slider-value">3.5s</span>
+            </span>
+            <input
+              id="showcase-hold-slider"
+              type="range"
+              min="1.5"
+              max="12"
+              value="3.5"
+              step="0.5"
+            />
+          </label>
           <label class="slider-row color-row" for="cube-color">
             <span class="slider-label">
               Cube color
@@ -144,6 +163,6 @@
         }
       }
     </script>
-    <script type="module" src="main.js?v=20"></script>
+    <script type="module" src="main.js?v=22"></script>
   </body>
 </html>

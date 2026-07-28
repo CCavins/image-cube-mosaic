@@ -16,6 +16,9 @@ const dwellSlider = document.getElementById("dwell-slider");
 const dwellValueEl = document.getElementById("dwell-value");
 const cubeColorInput = document.getElementById("cube-color");
 const cubeColorValueEl = document.getElementById("cube-color-value");
+const showcaseHoldRow = document.getElementById("showcase-hold-row");
+const showcaseHoldSlider = document.getElementById("showcase-hold-slider");
+const showcaseHoldValueEl = document.getElementById("showcase-hold-value");
 
 const PRESETS = [
   { id: "cluster", label: "Cluster" },
@@ -55,15 +58,17 @@ const _spinAxis = new THREE.Vector3();
 const _tmpQuat = new THREE.Quaternion();
 
 const SHOWCASE_MAX_FEATURED = 3;
+// Swap motion speeds stay fixed — hold slider only changes time spent presenting
 const SHOWCASE_APPROACH_S = 1.35;
-const SHOWCASE_PRESENT_S = 3.2;
 const SHOWCASE_RETREAT_S = 1.2;
-const SHOWCASE_PRESENT_SCALE = 1.2;
-// Center-of-frame present slots (camera looks at origin from +Z)
+const SHOWCASE_PRESENT_SCALE = 1.15;
+const SHOWCASE_HOLD_MIN_S = 1.5;
+const SHOWCASE_HOLD_MAX_S = 12;
+// Spaced so featured cubes never overlap at present scale (centers ≥ ~2.1 apart)
 const SHOWCASE_PRESENT_SLOTS = [
-  new THREE.Vector3(-1.15, 0.45, 5.5),
-  new THREE.Vector3(0.05, 0.65, 5.85),
-  new THREE.Vector3(1.2, 0.4, 5.5),
+  new THREE.Vector3(-2.25, 0.3, 5.55),
+  new THREE.Vector3(0.0, 0.55, 5.85),
+  new THREE.Vector3(2.25, 0.3, 5.55),
 ];
 
 const MAX_TILES = 52;
@@ -80,8 +85,18 @@ let nextImageId = 1;
 let activePreset = "cluster";
 let activeTileCount = MAX_TILES;
 let dwellMs = 4000;
+let showcaseHoldS = 3.5;
 let coverageTimer = 0;
 let densityApplyTimer = 0;
+const PLACEHOLDER_CANVAS = (() => {
+  const c = document.createElement("canvas");
+  c.width = 4;
+  c.height = 4;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#10131c";
+  ctx.fillRect(0, 0, 4, 4);
+  return c;
+})();
 
 const renderer = new THREE.WebGLRenderer({
   canvas,
@@ -309,8 +324,24 @@ function buildAllTargets(preset, count) {
     return targets;
   }
   if (preset === "showcase") {
-    // Light separation so the frustum-filling layout stays intact
-    return separateTargets(targets, 10);
+    // Shuffle home slots so tile index isn't tied to a screen region
+    for (let i = targets.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = targets[i];
+      targets[i] = targets[j];
+      targets[j] = tmp;
+    }
+    separateTargets(targets, 8);
+    // Pull anything that separation nudged off-screen back into the view
+    for (const t of targets) {
+      const { halfW, halfH } = frustumHalfExtentsAtZ(t.position.z, 0.86);
+      const pad = boundingRadius(t.scale) * 0.5;
+      const maxX = Math.max(0.15, halfW - pad);
+      const maxY = Math.max(0.15, halfH - pad);
+      t.position.x = THREE.MathUtils.clamp(t.position.x, -maxX, maxX);
+      t.position.y = THREE.MathUtils.clamp(t.position.y, -maxY, maxY);
+    }
+    return targets;
   }
   return separateTargets(targets);
 }
@@ -343,15 +374,16 @@ uniform float uImageMix;`
         "#include <map_fragment>",
         `
 #ifdef USE_MAP
-	vec4 sampledDiffuseColor = texture2D( map, vMapUv );
-	float imgA = clamp(sampledDiffuseColor.a * uImageMix, 0.0, 1.0);
-	// Transparent PNG pixels show the cube color underneath
-	diffuseColor = vec4(mix(diffuseColor.rgb, sampledDiffuseColor.rgb, imgA), 1.0);
+	if (uImageMix > 0.001) {
+		vec4 sampledDiffuseColor = texture2D( map, vMapUv );
+		float imgA = clamp(sampledDiffuseColor.a * uImageMix, 0.0, 1.0);
+		diffuseColor = vec4(mix(diffuseColor.rgb, sampledDiffuseColor.rgb, imgA), 1.0);
+	}
 #endif
 `
       );
   };
-  mat.customProgramCacheKey = () => "image-over-cube-std-v1";
+  mat.customProgramCacheKey = () => "image-over-cube-std-v2";
 
   return mat;
 }
@@ -619,34 +651,53 @@ function buildScatterTargets(i) {
   };
 }
 
-/** Idle field for Showcase — fill the camera frustum with floating, non-spinning cubes. */
-function buildShowcaseTargets(i, count) {
+/** Visible half-width/height at a world Z for the current camera/FOV. */
+function frustumHalfExtentsAtZ(z, margin = 0.88) {
   const aspect = Math.max(0.65, Math.min(2.4, window.innerWidth / window.innerHeight));
-  const layer = i % 4;
-  const z = 0.2 + layer * 1.15 + (seededNoise(i, 43) - 0.5) * 0.35;
-  // Approximate visible half-extents at this depth (camera ~z=10.5, fov 38°)
-  const dist = Math.max(4, camera.position.z - z);
-  const halfH = Math.tan((38 * Math.PI) / 360) * dist * 0.98;
-  const halfW = halfH * aspect * 0.98;
+  // Showcase camera sits at z≈10.5 looking at origin
+  const dist = Math.max(3.5, 10.5 - z);
+  const halfH = Math.tan((38 * Math.PI) / 360) * dist * margin;
+  const halfW = halfH * aspect * margin;
+  return { halfW, halfH };
+}
 
-  const cols = Math.max(4, Math.ceil(Math.sqrt(count * aspect * 1.15)));
+/** Idle field for Showcase — pack into the visible window; denser → smaller cubes. */
+function buildShowcaseTargets(i, count) {
+  // Keep all idle cubes in a shallow band that stays on-screen
+  const layers = Math.min(4, Math.max(2, Math.ceil(count / 18)));
+  const layer = i % layers;
+  const z = 0.6 + layer * 0.85 + (seededNoise(i, 43) - 0.5) * 0.2;
+  const { halfW, halfH } = frustumHalfExtentsAtZ(z, 0.86);
+
+  const aspect = halfW / Math.max(1e-6, halfH);
+  const cols = Math.max(3, Math.ceil(Math.sqrt(count * aspect)));
   const rows = Math.max(3, Math.ceil(count / cols));
+
   const col = i % cols;
   const row = Math.floor(i / cols) % rows;
-  const u = cols <= 1 ? 0.5 : col / (cols - 1);
-  const v = rows <= 1 ? 0.5 : row / (rows - 1);
-  const x = (u - 0.5) * 2 * halfW + (seededNoise(i, 41) - 0.5) * 0.55;
-  const y = (v - 0.5) * 2 * halfH + (seededNoise(i, 42) - 0.5) * 0.4;
+  const u = cols <= 1 ? 0.5 : (col + 0.5) / cols;
+  const v = rows <= 1 ? 0.5 : (row + 0.5) / rows;
+
+  // Scale down as density rises so the field still fits the window
+  const pack = Math.sqrt(28 / Math.max(8, count));
+  const scale = THREE.MathUtils.clamp(0.48 * pack + seededNoise(i, 47) * 0.08, 0.38, 0.85);
+  const pad = boundingRadius(scale) * 0.55;
+  const maxX = Math.max(0.2, halfW - pad);
+  const maxY = Math.max(0.2, halfH - pad);
+
+  let x = (u - 0.5) * 2 * maxX + (seededNoise(i, 41) - 0.5) * 0.25;
+  let y = (v - 0.5) * 2 * maxY + (seededNoise(i, 42) - 0.5) * 0.2;
+  x = THREE.MathUtils.clamp(x, -maxX, maxX);
+  y = THREE.MathUtils.clamp(y, -maxY, maxY);
 
   return {
     position: new THREE.Vector3(x, y, z),
-    // Face the camera; no tumbling idle pose
     rotation: new THREE.Euler(
       (seededNoise(i, 44) - 0.5) * 0.08,
       (seededNoise(i, 45) - 0.5) * 0.35,
       (seededNoise(i, 46) - 0.5) * 0.06
     ),
-    scale: 0.62 + seededNoise(i, 47) * 0.22,
+    scale,
     layer: "bg",
   };
 }
@@ -746,7 +797,8 @@ for (let i = 0; i < MAX_TILES; i++) {
   const faceSlots = Array.from({ length: 6 }, () => ({
     imageId: null,
     material: null,
-    faceTexture: null, // per-slot map with upright rotation (own Source)
+    faceTexture: null, // per-slot map with upright rotation
+    faceTextureImageId: null,
     fade: 0,
     state: "empty", // empty | fadingIn | holding | fadingOut
     holdUntil: 0,
@@ -856,7 +908,8 @@ function layoutActiveTiles(preset = activePreset, { snap = false } = {}) {
       if (preset === "showcase") {
         tile.role = "idle";
         tile.roleT = 0;
-        tile.roleDuration = 0.6 + seededNoise(i, 60) * 4.5;
+        // Randomize readiness so promotions aren't biased by tile index / grid row
+        tile.roleDuration = 0.4 + Math.random() * 5.5;
         tile.presentSlot = null;
       } else {
         tile.role = "idle";
@@ -882,6 +935,31 @@ function layoutActiveTiles(preset = activePreset, { snap = false } = {}) {
   }
 }
 
+function setShowcaseHoldSeconds(seconds) {
+  showcaseHoldS = Math.max(
+    SHOWCASE_HOLD_MIN_S,
+    Math.min(SHOWCASE_HOLD_MAX_S, Number(seconds) || 3.5)
+  );
+  if (showcaseHoldSlider) showcaseHoldSlider.value = String(showcaseHoldS);
+  if (showcaseHoldValueEl) {
+    showcaseHoldValueEl.textContent = `${showcaseHoldS.toFixed(1)}s`;
+  }
+  // Remap hold for cubes already presenting — does not change approach/retreat speed
+  for (let i = 0; i < activeTileCount; i++) {
+    const tile = tiles[i];
+    if (tile.role !== "present") continue;
+    const remaining = Math.max(0.2, tile.roleDuration - tile.roleT);
+    const frac = Math.min(1, remaining / Math.max(0.2, tile.roleDuration));
+    tile.roleDuration = showcaseHoldS;
+    tile.roleT = showcaseHoldS * (1 - frac);
+  }
+}
+
+function syncShowcaseHoldVisibility() {
+  if (!showcaseHoldRow) return;
+  showcaseHoldRow.hidden = activePreset !== "showcase";
+}
+
 function setPreset(id) {
   activePreset = id;
   layoutActiveTiles(id, { snap: false });
@@ -890,6 +968,7 @@ function setPreset(id) {
     btn.classList.toggle("active", on);
     btn.setAttribute("aria-selected", on ? "true" : "false");
   });
+  syncShowcaseHoldVisibility();
   statusEl.textContent = `Motion · ${PRESETS.find((p) => p.id === id)?.label ?? id}`;
 }
 
@@ -1000,7 +1079,12 @@ function computeUprightTextureRotation(tile, faceIndex) {
   return -Math.atan2(sin, cos);
 }
 
-function ensureSlotFaceTexture(slot, baseTexture, rotation) {
+function ensureSlotFaceTexture(slot, image, baseTexture, rotation) {
+  // Fresh texture whenever the image changes — avoids Source/GPU stacking glitches
+  if (slot.faceTexture && slot.faceTextureImageId !== image.id) {
+    slot.faceTexture.dispose();
+    slot.faceTexture = null;
+  }
   if (!slot.faceTexture) {
     slot.faceTexture = new THREE.Texture();
     slot.faceTexture.colorSpace = THREE.SRGBColorSpace;
@@ -1012,8 +1096,9 @@ function ensureSlotFaceTexture(slot, baseTexture, rotation) {
     slot.faceTexture.magFilter = THREE.LinearFilter;
     slot.faceTexture.anisotropy = baseTexture.anisotropy;
     slot.faceTexture.flipY = true;
+    slot.faceTextureImageId = image.id;
   }
-  slot.faceTexture.image = baseTexture.image;
+  slot.faceTexture.image = baseTexture.image || PLACEHOLDER_CANVAS;
   slot.faceTexture.rotation = rotation;
   slot.faceTexture.needsUpdate = true;
   return slot.faceTexture;
@@ -1023,7 +1108,12 @@ function applyTextureToSlot(tile, faceIndex, image, { fadeIn = true, holdJitter 
   const slot = tile.faceSlots[faceIndex];
   const baseTexture = ensureImageTexture(image);
   const rotation = computeUprightTextureRotation(tile, faceIndex);
-  const texture = ensureSlotFaceTexture(slot, baseTexture, rotation);
+  const texture = ensureSlotFaceTexture(slot, image, baseTexture, rotation);
+
+  // Reset mix before swapping maps so the previous image never composites over the new one
+  if (slot.material?.userData?.imageMix) {
+    slot.material.userData.imageMix.value = 0;
+  }
 
   if (!slot.material) {
     slot.material = makeImageMaterial(texture);
@@ -1337,90 +1427,147 @@ function smoothstep(t) {
 
 function assignShowcasePresentAnchor(tile, slotIndex) {
   const slot = SHOWCASE_PRESENT_SLOTS[slotIndex % SHOWCASE_PRESENT_SLOTS.length];
+  // Tiny jitter only — keep clear gaps between the three foreground slots
   tile.presentAnchor.set(
-    slot.x + (seededNoise(tile.index, 70) - 0.5) * 0.22,
-    slot.y + (seededNoise(tile.index, 71) - 0.5) * 0.18,
-    slot.z + (seededNoise(tile.index, 72) - 0.5) * 0.2
+    slot.x + (seededNoise(tile.index, 70) - 0.5) * 0.08,
+    slot.y + (seededNoise(tile.index, 71) - 0.5) * 0.06,
+    slot.z + (seededNoise(tile.index, 72) - 0.5) * 0.06
   );
 }
 
-/** Choreograph tiles: idle field → approach center FOV → present/spin → retreat. */
+function pickRandomShowcaseCandidate(ready) {
+  if (ready.length === 0) return null;
+  const idx = Math.floor(Math.random() * ready.length);
+  return ready[idx];
+}
+
+function beginShowcaseApproach(tile, slotIndex) {
+  tile.role = "approach";
+  tile.roleT = 0;
+  tile.roleDuration = SHOWCASE_APPROACH_S;
+  tile.presentSlot = slotIndex;
+  assignShowcasePresentAnchor(tile, slotIndex);
+}
+
+function beginShowcaseRetreat(tile) {
+  tile.role = "retreat";
+  tile.roleT = 0;
+  tile.roleDuration = SHOWCASE_RETREAT_S;
+}
+
+/**
+ * Showcase choreography:
+ * - Up to 3 cubes hold in spaced foreground slots
+ * - Hold slider = how long they stay (not swap motion speed)
+ * - Only one approach OR retreat runs at a time
+ */
 function updateShowcase(dt, t) {
-  let featured = 0;
   const usedSlots = new Set();
-  for (let i = 0; i < activeTileCount; i++) {
-    const tile = tiles[i];
-    if (tile.role !== "idle") {
-      featured++;
-      if (tile.presentSlot != null) usedSlots.add(tile.presentSlot);
-    }
-  }
+  const readyIdle = [];
+  const presenting = [];
+  let approaching = null;
+  let retreating = null;
 
   for (let i = 0; i < activeTileCount; i++) {
     const tile = tiles[i];
     tile.roleT += dt;
 
-    if (tile.role === "idle") {
-      if (tile.roleT >= tile.roleDuration && featured < SHOWCASE_MAX_FEATURED) {
+    if (tile.role === "approach") approaching = tile;
+    else if (tile.role === "retreat") retreating = tile;
+    else if (tile.role === "present") {
+      presenting.push(tile);
+      if (tile.presentSlot != null) usedSlots.add(tile.presentSlot);
+    } else if (tile.role === "idle" && tile.roleT >= tile.roleDuration) {
+      readyIdle.push(tile);
+    }
+
+    if (tile.presentSlot != null && tile.role !== "idle") {
+      usedSlots.add(tile.presentSlot);
+    }
+  }
+
+  const transitioning = !!(approaching || retreating);
+
+  // Finish approach → present (hold duration from slider only)
+  if (approaching && approaching.roleT >= approaching.roleDuration) {
+    approaching.role = "present";
+    approaching.roleT = 0;
+    approaching.roleDuration = showcaseHoldS;
+    presenting.push(approaching);
+    approaching = null;
+  }
+
+  // Finish retreat → idle
+  if (retreating && retreating.roleT >= retreating.roleDuration) {
+    retreating.role = "idle";
+    retreating.roleT = 0;
+    retreating.roleDuration = 1.2 + Math.random() * 4.5;
+    retreating.presentSlot = null;
+    retreating = null;
+  }
+
+  // Only one swap motion at a time. Fill empty foreground slots first, then rotate out.
+  if (!approaching && !retreating) {
+    const expired = presenting
+      .filter((tile) => tile.roleT >= tile.roleDuration)
+      .sort((a, b) => b.roleT - a.roleT);
+
+    if (presenting.length < SHOWCASE_MAX_FEATURED) {
+      const tile = pickRandomShowcaseCandidate(readyIdle);
+      if (tile) {
         let slotIndex = 0;
         while (usedSlots.has(slotIndex) && slotIndex < SHOWCASE_MAX_FEATURED) {
           slotIndex++;
         }
-        tile.role = "approach";
-        tile.roleT = 0;
-        tile.roleDuration = SHOWCASE_APPROACH_S;
-        tile.presentSlot = slotIndex;
-        assignShowcasePresentAnchor(tile, slotIndex);
-        usedSlots.add(slotIndex);
-        featured++;
-      } else {
-        tile.target.position.copy(tile.home.position);
-        tile.target.rotation.copy(tile.home.rotation);
-        tile.target.scale = tile.home.scale;
-        continue;
+        if (slotIndex < SHOWCASE_MAX_FEATURED) {
+          beginShowcaseApproach(tile, slotIndex);
+        }
       }
+    } else if (expired.length > 0) {
+      beginShowcaseRetreat(expired[0]);
+    }
+  }
+
+  for (let i = 0; i < activeTileCount; i++) {
+    const tile = tiles[i];
+
+    if (tile.role === "idle") {
+      tile.target.position.copy(tile.home.position);
+      tile.target.rotation.copy(tile.home.rotation);
+      tile.target.scale = tile.home.scale;
+      continue;
     }
 
     if (tile.role === "approach") {
-      const u = smoothstep(Math.min(1, tile.roleT / tile.roleDuration));
+      const u = smoothstep(Math.min(1, tile.roleT / SHOWCASE_APPROACH_S));
       tile.target.position.lerpVectors(tile.home.position, tile.presentAnchor, u);
       tile.target.scale = THREE.MathUtils.lerp(
         tile.home.scale,
         SHOWCASE_PRESENT_SCALE,
         u
       );
-      // Ease toward a camera-facing pose in the center of the frame
       tile.target.rotation.set(
         THREE.MathUtils.lerp(tile.home.rotation.x, 0.04, u),
         THREE.MathUtils.lerp(tile.home.rotation.y, 0, u),
         THREE.MathUtils.lerp(tile.home.rotation.z, 0, u)
       );
-      if (tile.roleT >= tile.roleDuration) {
-        tile.role = "present";
-        tile.roleT = 0;
-        tile.roleDuration = SHOWCASE_PRESENT_S + seededNoise(i, 61) * 1.4;
-      }
       continue;
     }
 
     if (tile.role === "present") {
+      // Subtle bob only — keep clear of neighboring foreground slots
       tile.target.position.set(
-        tile.presentAnchor.x + Math.sin(t * 0.7 + tile.phase) * 0.06,
-        tile.presentAnchor.y + Math.cos(t * 0.55 + tile.phase) * 0.08,
+        tile.presentAnchor.x + Math.sin(t * 0.7 + tile.phase) * 0.03,
+        tile.presentAnchor.y + Math.cos(t * 0.55 + tile.phase) * 0.04,
         tile.presentAnchor.z
       );
       tile.target.scale = SHOWCASE_PRESENT_SCALE;
       tile.target.rotation.set(0.04, 0, 0);
-      if (tile.roleT >= tile.roleDuration) {
-        tile.role = "retreat";
-        tile.roleT = 0;
-        tile.roleDuration = SHOWCASE_RETREAT_S;
-      }
       continue;
     }
 
     if (tile.role === "retreat") {
-      const u = smoothstep(Math.min(1, tile.roleT / tile.roleDuration));
+      const u = smoothstep(Math.min(1, tile.roleT / SHOWCASE_RETREAT_S));
       tile.target.position.lerpVectors(tile.presentAnchor, tile.home.position, u);
       tile.target.scale = THREE.MathUtils.lerp(
         SHOWCASE_PRESENT_SCALE,
@@ -1430,15 +1577,6 @@ function updateShowcase(dt, t) {
       tile.target.rotation.x = THREE.MathUtils.lerp(0.04, tile.home.rotation.x, u);
       tile.target.rotation.y = THREE.MathUtils.lerp(0, tile.home.rotation.y, u);
       tile.target.rotation.z = THREE.MathUtils.lerp(0, tile.home.rotation.z, u);
-      if (tile.roleT >= tile.roleDuration) {
-        tile.role = "idle";
-        tile.roleT = 0;
-        tile.roleDuration = 1.8 + seededNoise(i, 62) * 5.5;
-        tile.presentSlot = null;
-        tile.target.position.copy(tile.home.position);
-        tile.target.rotation.copy(tile.home.rotation);
-        tile.target.scale = tile.home.scale;
-      }
     }
   }
 }
@@ -1593,6 +1731,17 @@ dwellSlider.addEventListener("input", () => {
   setDwellSeconds(Number(dwellSlider.value));
 });
 setDwellSeconds(Number(dwellSlider.value));
+
+if (showcaseHoldSlider) {
+  showcaseHoldSlider.min = String(SHOWCASE_HOLD_MIN_S);
+  showcaseHoldSlider.max = String(SHOWCASE_HOLD_MAX_S);
+  showcaseHoldSlider.step = "0.5";
+  showcaseHoldSlider.addEventListener("input", () => {
+    setShowcaseHoldSeconds(Number(showcaseHoldSlider.value));
+  });
+  setShowcaseHoldSeconds(Number(showcaseHoldSlider.value) || showcaseHoldS);
+}
+syncShowcaseHoldVisibility();
 
 cubeColorInput.addEventListener("input", () => {
   setCubeColor(cubeColorInput.value);
