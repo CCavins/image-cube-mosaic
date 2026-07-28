@@ -30,16 +30,41 @@ const PRESETS = [
   { id: "depth", label: "Depth Field" },
 ];
 
-// Box face order: +X, -X, +Y, -Y, +Z, -Z — images only on upright-capable sides
+// Box face order: +X, -X, +Y, -Y, +Z, -Z
 const SIDE_FACES = [0, 1, 4, 5];
-const TOP_BOTTOM_FACES = [2, 3];
+const ALL_FACES = [0, 1, 2, 3, 4, 5];
+
+// Local UV basis per face (must match orientCubeFaceUVs): U = right, V = up on face
+const FACE_BASIS_LOCAL = [
+  { u: new THREE.Vector3(0, 0, -1), v: new THREE.Vector3(0, 1, 0), n: new THREE.Vector3(1, 0, 0) }, // +X
+  { u: new THREE.Vector3(0, 0, 1), v: new THREE.Vector3(0, 1, 0), n: new THREE.Vector3(-1, 0, 0) }, // -X
+  { u: new THREE.Vector3(1, 0, 0), v: new THREE.Vector3(0, 0, -1), n: new THREE.Vector3(0, 1, 0) }, // +Y
+  { u: new THREE.Vector3(1, 0, 0), v: new THREE.Vector3(0, 0, 1), n: new THREE.Vector3(0, -1, 0) }, // -Y
+  { u: new THREE.Vector3(1, 0, 0), v: new THREE.Vector3(0, 1, 0), n: new THREE.Vector3(0, 0, 1) }, // +Z
+  { u: new THREE.Vector3(-1, 0, 0), v: new THREE.Vector3(0, 1, 0), n: new THREE.Vector3(0, 0, -1) }, // -Z
+];
+
+const _faceN = new THREE.Vector3();
+const _faceU = new THREE.Vector3();
+const _faceV = new THREE.Vector3();
+const _desiredUp = new THREE.Vector3();
+const _screenUp = new THREE.Vector3();
+const _viewDir = new THREE.Vector3();
+const _worldPos = new THREE.Vector3();
+const _spinAxis = new THREE.Vector3();
+const _tmpQuat = new THREE.Quaternion();
 
 const SHOWCASE_MAX_FEATURED = 3;
 const SHOWCASE_APPROACH_S = 1.35;
 const SHOWCASE_PRESENT_S = 3.2;
 const SHOWCASE_RETREAT_S = 1.2;
-const SHOWCASE_PRESENT_Z = 4.6;
-const SHOWCASE_PRESENT_SCALE = 1.05;
+const SHOWCASE_PRESENT_SCALE = 1.2;
+// Center-of-frame present slots (camera looks at origin from +Z)
+const SHOWCASE_PRESENT_SLOTS = [
+  new THREE.Vector3(-1.15, 0.45, 5.5),
+  new THREE.Vector3(0.05, 0.65, 5.85),
+  new THREE.Vector3(1.2, 0.4, 5.5),
+];
 
 const MAX_TILES = 52;
 const MIN_TILES = 8;
@@ -156,10 +181,12 @@ function orientCubeFaceUVs(geom) {
     geom.addGroup(face * perFace, perFace, face);
   }
 
-  // Looking from outside: U = right, V = up (+Y) on side faces
+  // Looking from outside: U = right, V = image-up (matches FACE_BASIS_LOCAL)
   const faceAxes = {
     0: { uAxis: "z", uSign: -1, vAxis: "y", vSign: 1 }, // +X
     1: { uAxis: "z", uSign: 1, vAxis: "y", vSign: 1 }, // -X
+    2: { uAxis: "x", uSign: 1, vAxis: "z", vSign: -1 }, // +Y
+    3: { uAxis: "x", uSign: 1, vAxis: "z", vSign: 1 }, // -Y
     4: { uAxis: "x", uSign: 1, vAxis: "y", vSign: 1 }, // +Z
     5: { uAxis: "x", uSign: -1, vAxis: "y", vSign: 1 }, // -Z
   };
@@ -170,7 +197,7 @@ function orientCubeFaceUVs(geom) {
     z: (i) => pos.getZ(i),
   };
 
-  for (const face of SIDE_FACES) {
+  for (const face of ALL_FACES) {
     const axes = faceAxes[face];
     const start = face * perFace;
     const end = start + perFace;
@@ -282,7 +309,8 @@ function buildAllTargets(preset, count) {
     return targets;
   }
   if (preset === "showcase") {
-    return separateTargets(targets, 20);
+    // Light separation so the frustum-filling layout stays intact
+    return separateTargets(targets, 10);
   }
   return separateTargets(targets);
 }
@@ -368,12 +396,17 @@ function ensureImageTexture(image) {
   img.onload = () => {
     texture.image = makeCoverSquareCanvas(img, MAX_TEX_SIZE);
     texture.needsUpdate = true;
-    // Materials already point at this texture — force a refresh
+    // Per-face slot textures share the canvas pixels but keep their own rotation
     for (const tile of tiles) {
-      for (const slot of tile.faceSlots) {
-        if (slot.imageId === image.id && slot.material) {
-          slot.material.map = texture;
-          slot.material.needsUpdate = true;
+      for (let f = 0; f < 6; f++) {
+        const slot = tile.faceSlots[f];
+        if (slot.imageId === image.id && slot.faceTexture) {
+          slot.faceTexture.image = texture.image;
+          slot.faceTexture.needsUpdate = true;
+          if (slot.material) {
+            slot.material.map = slot.faceTexture;
+            slot.material.needsUpdate = true;
+          }
         }
       }
     }
@@ -390,8 +423,12 @@ function disposeImageTexture(image) {
   if (!image?.texture) return;
   for (const tile of tiles) {
     for (const slot of tile.faceSlots) {
-      if (slot.imageId === image.id && slot.material) {
-        slot.material.map = null;
+      if (slot.imageId === image.id) {
+        if (slot.material) slot.material.map = null;
+        if (slot.faceTexture) {
+          slot.faceTexture.dispose();
+          slot.faceTexture = null;
+        }
       }
     }
   }
@@ -582,20 +619,34 @@ function buildScatterTargets(i) {
   };
 }
 
-/** Idle field for Showcase — mid/back depth; choreography advances tiles forward. */
+/** Idle field for Showcase — fill the camera frustum with floating, non-spinning cubes. */
 function buildShowcaseTargets(i, count) {
-  const cols = Math.ceil(Math.sqrt(count * 1.35));
-  const rows = Math.ceil(count / cols);
+  const aspect = Math.max(0.65, Math.min(2.4, window.innerWidth / window.innerHeight));
+  const layer = i % 4;
+  const z = 0.2 + layer * 1.15 + (seededNoise(i, 43) - 0.5) * 0.35;
+  // Approximate visible half-extents at this depth (camera ~z=10.5, fov 38°)
+  const dist = Math.max(4, camera.position.z - z);
+  const halfH = Math.tan((38 * Math.PI) / 360) * dist * 0.98;
+  const halfW = halfH * aspect * 0.98;
+
+  const cols = Math.max(4, Math.ceil(Math.sqrt(count * aspect * 1.15)));
+  const rows = Math.max(3, Math.ceil(count / cols));
   const col = i % cols;
-  const row = Math.floor(i / cols);
-  const spacing = minCenterDistance(0.72, 0.72) * 1.05;
-  const x = (col - (cols - 1) / 2) * spacing + (seededNoise(i, 41) - 0.5) * 0.35;
-  const y = (row - (rows - 1) / 2) * spacing * 0.85 + (seededNoise(i, 42) - 0.5) * 0.3;
-  const z = -1.2 + seededNoise(i, 43) * 2.4;
+  const row = Math.floor(i / cols) % rows;
+  const u = cols <= 1 ? 0.5 : col / (cols - 1);
+  const v = rows <= 1 ? 0.5 : row / (rows - 1);
+  const x = (u - 0.5) * 2 * halfW + (seededNoise(i, 41) - 0.5) * 0.55;
+  const y = (v - 0.5) * 2 * halfH + (seededNoise(i, 42) - 0.5) * 0.4;
+
   return {
     position: new THREE.Vector3(x, y, z),
-    rotation: new THREE.Euler(0, seededNoise(i, 44) * Math.PI * 2, 0),
-    scale: 0.7 + seededNoise(i, 45) * 0.15,
+    // Face the camera; no tumbling idle pose
+    rotation: new THREE.Euler(
+      (seededNoise(i, 44) - 0.5) * 0.08,
+      (seededNoise(i, 45) - 0.5) * 0.35,
+      (seededNoise(i, 46) - 0.5) * 0.06
+    ),
+    scale: 0.62 + seededNoise(i, 47) * 0.22,
     layer: "bg",
   };
 }
@@ -695,6 +746,7 @@ for (let i = 0; i < MAX_TILES; i++) {
   const faceSlots = Array.from({ length: 6 }, () => ({
     imageId: null,
     material: null,
+    faceTexture: null, // per-slot map with upright rotation (own Source)
     fade: 0,
     state: "empty", // empty | fadingIn | holding | fadingOut
     holdUntil: 0,
@@ -709,6 +761,7 @@ for (let i = 0; i < MAX_TILES; i++) {
     role: "idle", // showcase: idle | approach | present | retreat
     roleT: 0,
     roleDuration: 1,
+    presentSlot: null,
     presentAnchor: new THREE.Vector3(),
     phase: seededNoise(i, 20) * Math.PI * 2,
     spin: new THREE.Vector3(
@@ -742,7 +795,11 @@ function emptyFaceMaterial(tile) {
 }
 
 function applySpinForPreset(tile, preset) {
-  if (preset === "showcase" || preset === "depth") {
+  if (preset === "showcase") {
+    // Only featured cubes spin (Y); idle field stays float-only
+    const dir = seededNoise(tile.index, 22) > 0.5 ? 1 : -1;
+    tile.spin.set(0, dir * 0.32, 0);
+  } else if (preset === "depth") {
     // Y-dominant spin keeps side-face images upright while turning
     const dir = seededNoise(tile.index, 22) > 0.5 ? 1 : -1;
     tile.spin.set(
@@ -800,9 +857,11 @@ function layoutActiveTiles(preset = activePreset, { snap = false } = {}) {
         tile.role = "idle";
         tile.roleT = 0;
         tile.roleDuration = 0.6 + seededNoise(i, 60) * 4.5;
+        tile.presentSlot = null;
       } else {
         tile.role = "idle";
         tile.roleT = 0;
+        tile.presentSlot = null;
       }
 
       if (snap) {
@@ -904,9 +963,67 @@ function clearFaceSlot(tile, faceIndex) {
   slot.pendingImage = null;
 }
 
+/**
+ * Rotation that makes texture V align with screen-up on this face,
+ * given the cube's current world orientation and the browser camera.
+ */
+function computeUprightTextureRotation(tile, faceIndex) {
+  const basis = FACE_BASIS_LOCAL[faceIndex];
+  tile.mesh.updateMatrixWorld(true);
+  tile.mesh.getWorldQuaternion(_tmpQuat);
+
+  _faceN.copy(basis.n).applyQuaternion(_tmpQuat).normalize();
+  _faceU.copy(basis.u).applyQuaternion(_tmpQuat).normalize();
+  _faceV.copy(basis.v).applyQuaternion(_tmpQuat).normalize();
+
+  camera.updateMatrixWorld(true);
+  _screenUp.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+
+  // Project screen-up onto the face plane → desired image "up"
+  _desiredUp.copy(_screenUp).addScaledVector(_faceN, -_screenUp.dot(_faceN));
+  if (_desiredUp.lengthSq() < 1e-8) {
+    // Looking straight onto top/bottom: aim image up toward top of the window
+    // using the camera's view-up via the facing direction
+    tile.mesh.getWorldPosition(_worldPos);
+    _viewDir.subVectors(camera.position, _worldPos).normalize();
+    _desiredUp.crossVectors(_faceN, _viewDir).cross(_faceN);
+    if (_desiredUp.lengthSq() < 1e-8) {
+      _desiredUp.set(0, 0, -1).applyQuaternion(_tmpQuat);
+      _desiredUp.addScaledVector(_faceN, -_desiredUp.dot(_faceN));
+    }
+  }
+  _desiredUp.normalize();
+
+  // Angle of desiredUp relative to current V axis in the face plane
+  const cos = THREE.MathUtils.clamp(_desiredUp.dot(_faceV), -1, 1);
+  const sin = _desiredUp.dot(_faceU);
+  return -Math.atan2(sin, cos);
+}
+
+function ensureSlotFaceTexture(slot, baseTexture, rotation) {
+  if (!slot.faceTexture) {
+    slot.faceTexture = new THREE.Texture();
+    slot.faceTexture.colorSpace = THREE.SRGBColorSpace;
+    slot.faceTexture.wrapS = THREE.ClampToEdgeWrapping;
+    slot.faceTexture.wrapT = THREE.ClampToEdgeWrapping;
+    slot.faceTexture.center.set(0.5, 0.5);
+    slot.faceTexture.generateMipmaps = true;
+    slot.faceTexture.minFilter = THREE.LinearMipmapLinearFilter;
+    slot.faceTexture.magFilter = THREE.LinearFilter;
+    slot.faceTexture.anisotropy = baseTexture.anisotropy;
+    slot.faceTexture.flipY = true;
+  }
+  slot.faceTexture.image = baseTexture.image;
+  slot.faceTexture.rotation = rotation;
+  slot.faceTexture.needsUpdate = true;
+  return slot.faceTexture;
+}
+
 function applyTextureToSlot(tile, faceIndex, image, { fadeIn = true, holdJitter = true } = {}) {
   const slot = tile.faceSlots[faceIndex];
-  const texture = ensureImageTexture(image);
+  const baseTexture = ensureImageTexture(image);
+  const rotation = computeUprightTextureRotation(tile, faceIndex);
+  const texture = ensureSlotFaceTexture(slot, baseTexture, rotation);
 
   if (!slot.material) {
     slot.material = makeImageMaterial(texture);
@@ -944,30 +1061,53 @@ function applyTextureToSlot(tile, faceIndex, image, { fadeIn = true, holdJitter 
   }
 }
 
-/** Higher = better candidate for upright-looking placement. */
+/**
+ * Prefer faces that face the camera and stay upright under the cube's spin
+ * (e.g. side faces when spinning mostly on Y).
+ */
 function faceUprightScore(faceIndex, tile) {
-  const isSide = SIDE_FACES.includes(faceIndex);
-  let score = isSide ? 12 : 1;
+  const basis = FACE_BASIS_LOCAL[faceIndex];
+  tile.mesh.updateMatrixWorld(true);
+  tile.mesh.getWorldQuaternion(_tmpQuat);
+  tile.mesh.getWorldPosition(_worldPos);
 
-  const ax = Math.abs(tile.spin.x);
-  const ay = Math.abs(tile.spin.y);
-  const az = Math.abs(tile.spin.z);
-  const yDom = ay / (ax + ay + az + 1e-6);
-  score += isSide ? yDom * 5 : -yDom * 4;
+  _faceN.copy(basis.n).applyQuaternion(_tmpQuat).normalize();
+  _faceV.copy(basis.v).applyQuaternion(_tmpQuat).normalize();
 
-  if (tile.role === "present" || tile.role === "approach") score += 6;
-  if (tile.layer === "fg") score += 3;
+  _viewDir.subVectors(camera.position, _worldPos).normalize();
+  const facing = Math.max(0, _faceN.dot(_viewDir));
+
+  // Spin axis in world (local spin applied as Euler rates ≈ object axes)
+  _spinAxis.set(tile.spin.x, tile.spin.y, tile.spin.z);
+  const spinLen = _spinAxis.length();
+  let uprightStable = 0.5;
+  if (spinLen > 1e-4) {
+    _spinAxis.multiplyScalar(1 / spinLen).applyQuaternion(_tmpQuat).normalize();
+    // Image stays upright while spinning if V stays aligned with screen-up
+    // ≈ spin axis parallel to world/screen up, and V parallel to spin axis
+    camera.updateMatrixWorld(true);
+    _screenUp.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+    const spinAlongUp = Math.abs(_spinAxis.dot(_screenUp));
+    const vAlongSpin = Math.abs(_faceV.dot(_spinAxis));
+    uprightStable = spinAlongUp * vAlongSpin;
+    // Top/bottom: normal ‖ spin (Y) → in-plane image tumbles; down-weight
+    const normalAlongSpin = Math.abs(_faceN.dot(_spinAxis));
+    uprightStable *= 1 - normalAlongSpin * 0.85;
+  } else if (SIDE_FACES.includes(faceIndex)) {
+    uprightStable = 0.9;
+  }
+
+  let score = facing * 10 + uprightStable * 12;
+  if (tile.role === "present" || tile.role === "approach") score += 4;
+  if (tile.layer === "fg") score += 2;
   if (tile.layer === "bg" && activePreset === "depth") score -= 1;
-
-  score += tile.current.position.z * 0.45;
+  score += tile.current.position.z * 0.25;
   return score;
 }
 
 function beginFaceCycle(tile, faceIndex, image) {
   const slot = tile.faceSlots[faceIndex];
   if (!image) return;
-  // Never place images on top/bottom — they read sideways/upside-down
-  if (!SIDE_FACES.includes(faceIndex)) return;
 
   // Empty face — fade in directly
   if (slot.state === "empty" || !slot.material) {
@@ -1015,13 +1155,13 @@ function imagesOnTile(tile, excludeFace = -1) {
   return ids;
 }
 
-/** Global usage counts across active side faces (shown + pending). */
+/** Global usage counts across active faces (shown + pending). */
 function countImageUsage() {
   const counts = new Map();
   for (const img of images) counts.set(img.id, 0);
   for (let i = 0; i < activeTileCount; i++) {
     const tile = tiles[i];
-    for (const f of SIDE_FACES) {
+    for (let f = 0; f < 6; f++) {
       const slot = tile.faceSlots[f];
       if (slot.imageId != null && counts.has(slot.imageId)) {
         counts.set(slot.imageId, counts.get(slot.imageId) + 1);
@@ -1075,43 +1215,22 @@ function pickImageForTile(
   return best;
 }
 
-function listActiveSideFaceRefs() {
+function listActiveFaceRefs() {
   const refs = [];
   for (let i = 0; i < activeTileCount; i++) {
     const tile = tiles[i];
-    for (const f of SIDE_FACES) {
+    for (let f = 0; f < 6; f++) {
       refs.push({ tile, face: f, slot: tile.faceSlots[f] });
     }
   }
   return refs;
 }
 
-/** Clear any images that landed on top/bottom (never upright under Y-spin). */
-function clearTopBottomFaces() {
-  for (let i = 0; i < activeTileCount; i++) {
-    const tile = tiles[i];
-    for (const f of TOP_BOTTOM_FACES) {
-      const slot = tile.faceSlots[f];
-      if (slot.state === "empty" && !slot.pendingImage) continue;
-      if (slot.state === "holding" || slot.state === "fadingIn") {
-        slot.pendingImage = null;
-        slot.state = "fadingOut";
-      } else if (slot.state === "fadingOut") {
-        slot.pendingImage = null;
-      } else {
-        clearFaceSlot(tile, f);
-      }
-    }
-  }
-}
-
-/** Keep most side faces imaged; never place on top/bottom. */
+/** Keep most faces imaged; prefer camera-facing / upright-stable faces first. */
 function ensureFaceCoverage(force = false) {
   if (images.length === 0) return;
 
-  clearTopBottomFaces();
-
-  const refs = listActiveSideFaceRefs();
+  const refs = listActiveFaceRefs();
   const busy = refs.filter((r) => r.slot.state !== "empty");
   const targetFilled = Math.max(1, Math.floor(refs.length * FACE_COVERAGE));
   let need = targetFilled - busy.length;
@@ -1123,7 +1242,7 @@ function ensureFaceCoverage(force = false) {
     .sort((a, b) => {
       const scoreDiff =
         faceUprightScore(b.face, b.tile) - faceUprightScore(a.face, a.tile);
-      return scoreDiff + (Math.random() - 0.5) * 0.4;
+      return scoreDiff + (Math.random() - 0.5) * 0.35;
     });
 
   const usage = countImageUsage();
@@ -1152,7 +1271,6 @@ function updateFaceTransitions(dt, now) {
     const tile = tiles[i];
     for (let f = 0; f < 6; f++) {
       const slot = tile.faceSlots[f];
-      const isSide = SIDE_FACES.includes(f);
 
       if (slot.state === "fadingIn") {
         slot.fade = Math.min(1, slot.fade + dt * fadeSpeed);
@@ -1166,7 +1284,7 @@ function updateFaceTransitions(dt, now) {
           activeFades--;
         }
       } else if (slot.state === "holding") {
-        if (!isSide || images.length === 0) {
+        if (images.length === 0) {
           if (activeFades < MAX_ACTIVE_FADES) {
             slot.state = "fadingOut";
             slot.pendingImage = null;
@@ -1191,8 +1309,8 @@ function updateFaceTransitions(dt, now) {
           slot.material.userData.imageMix.value = smoothstep(slot.fade);
         }
         if (slot.fade <= 0) {
-          let next = isSide ? slot.pendingImage : null;
-          if (isSide && (!next || !images.some((img) => img.id === next.id))) {
+          let next = slot.pendingImage;
+          if (!next || !images.some((img) => img.id === next.id)) {
             next = images.length
               ? pickImageForTile(tile, {
                   excludeFace: f,
@@ -1200,7 +1318,7 @@ function updateFaceTransitions(dt, now) {
                 })
               : null;
           }
-          if (next && isSide) {
+          if (next) {
             applyTextureToSlot(tile, f, next, { fadeIn: true });
           } else {
             clearFaceSlot(tile, f);
@@ -1217,11 +1335,25 @@ function smoothstep(t) {
   return x * x * (3 - 2 * x);
 }
 
-/** Choreograph tiles: idle field → approach → present/spin → retreat. */
+function assignShowcasePresentAnchor(tile, slotIndex) {
+  const slot = SHOWCASE_PRESENT_SLOTS[slotIndex % SHOWCASE_PRESENT_SLOTS.length];
+  tile.presentAnchor.set(
+    slot.x + (seededNoise(tile.index, 70) - 0.5) * 0.22,
+    slot.y + (seededNoise(tile.index, 71) - 0.5) * 0.18,
+    slot.z + (seededNoise(tile.index, 72) - 0.5) * 0.2
+  );
+}
+
+/** Choreograph tiles: idle field → approach center FOV → present/spin → retreat. */
 function updateShowcase(dt, t) {
   let featured = 0;
+  const usedSlots = new Set();
   for (let i = 0; i < activeTileCount; i++) {
-    if (tiles[i].role !== "idle") featured++;
+    const tile = tiles[i];
+    if (tile.role !== "idle") {
+      featured++;
+      if (tile.presentSlot != null) usedSlots.add(tile.presentSlot);
+    }
   }
 
   for (let i = 0; i < activeTileCount; i++) {
@@ -1230,14 +1362,16 @@ function updateShowcase(dt, t) {
 
     if (tile.role === "idle") {
       if (tile.roleT >= tile.roleDuration && featured < SHOWCASE_MAX_FEATURED) {
+        let slotIndex = 0;
+        while (usedSlots.has(slotIndex) && slotIndex < SHOWCASE_MAX_FEATURED) {
+          slotIndex++;
+        }
         tile.role = "approach";
         tile.roleT = 0;
         tile.roleDuration = SHOWCASE_APPROACH_S;
-        tile.presentAnchor.set(
-          tile.home.position.x * 0.55 + (seededNoise(i, 70) - 0.5) * 0.8,
-          tile.home.position.y * 0.5 + (seededNoise(i, 71) - 0.5) * 0.6,
-          SHOWCASE_PRESENT_Z
-        );
+        tile.presentSlot = slotIndex;
+        assignShowcasePresentAnchor(tile, slotIndex);
+        usedSlots.add(slotIndex);
         featured++;
       } else {
         tile.target.position.copy(tile.home.position);
@@ -1255,10 +1389,11 @@ function updateShowcase(dt, t) {
         SHOWCASE_PRESENT_SCALE,
         u
       );
+      // Ease toward a camera-facing pose in the center of the frame
       tile.target.rotation.set(
-        tile.home.rotation.x * (1 - u),
-        tile.home.rotation.y + u * 0.4,
-        tile.home.rotation.z * (1 - u)
+        THREE.MathUtils.lerp(tile.home.rotation.x, 0.04, u),
+        THREE.MathUtils.lerp(tile.home.rotation.y, 0, u),
+        THREE.MathUtils.lerp(tile.home.rotation.z, 0, u)
       );
       if (tile.roleT >= tile.roleDuration) {
         tile.role = "present";
@@ -1270,12 +1405,12 @@ function updateShowcase(dt, t) {
 
     if (tile.role === "present") {
       tile.target.position.set(
-        tile.presentAnchor.x + Math.sin(t * 0.7 + tile.phase) * 0.08,
-        tile.presentAnchor.y + Math.cos(t * 0.55 + tile.phase) * 0.1,
-        SHOWCASE_PRESENT_Z
+        tile.presentAnchor.x + Math.sin(t * 0.7 + tile.phase) * 0.06,
+        tile.presentAnchor.y + Math.cos(t * 0.55 + tile.phase) * 0.08,
+        tile.presentAnchor.z
       );
       tile.target.scale = SHOWCASE_PRESENT_SCALE;
-      tile.target.rotation.set(0.05, tile.home.rotation.y, 0);
+      tile.target.rotation.set(0.04, 0, 0);
       if (tile.roleT >= tile.roleDuration) {
         tile.role = "retreat";
         tile.roleT = 0;
@@ -1292,13 +1427,14 @@ function updateShowcase(dt, t) {
         tile.home.scale,
         u
       );
-      tile.target.rotation.x = THREE.MathUtils.lerp(0.05, tile.home.rotation.x, u);
-      tile.target.rotation.y = tile.home.rotation.y;
+      tile.target.rotation.x = THREE.MathUtils.lerp(0.04, tile.home.rotation.x, u);
+      tile.target.rotation.y = THREE.MathUtils.lerp(0, tile.home.rotation.y, u);
       tile.target.rotation.z = THREE.MathUtils.lerp(0, tile.home.rotation.z, u);
       if (tile.roleT >= tile.roleDuration) {
         tile.role = "idle";
         tile.roleT = 0;
         tile.roleDuration = 1.8 + seededNoise(i, 62) * 5.5;
+        tile.presentSlot = null;
         tile.target.position.copy(tile.home.position);
         tile.target.rotation.copy(tile.home.rotation);
         tile.target.scale = tile.home.scale;
@@ -1470,6 +1606,9 @@ window.addEventListener("resize", () => {
     camera.aspect = window.innerWidth / window.innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
+    if (activePreset === "showcase") {
+      layoutActiveTiles("showcase", { snap: false });
+    }
   }, 100);
 });
 
@@ -1497,9 +1636,9 @@ function animate() {
   // Global group motion varies by preset
   const breathe = Math.sin(t * 0.35) * 0.04;
   if (activePreset === "showcase") {
-    root.rotation.y = t * 0.035;
-    root.rotation.x = Math.sin(t * 0.14) * 0.04 + breathe * 0.5;
-    root.position.y = Math.sin(t * 0.3) * 0.06;
+    // No group spiral — field stays screen-filling; only individual float
+    root.rotation.set(0, 0, 0);
+    root.position.set(0, 0, 0);
   } else if (activePreset === "depth") {
     root.rotation.y = Math.sin(t * 0.12) * 0.1;
     root.rotation.x = Math.sin(t * 0.16) * 0.05 + breathe * 0.6;
@@ -1518,7 +1657,7 @@ function animate() {
       : activePreset === "wave" || activePreset === "depth"
         ? 0.55
         : activePreset === "showcase"
-          ? 0.3
+          ? 1.15
           : activePreset === "cluster"
             ? 0.25
             : 0.4;
@@ -1540,8 +1679,14 @@ function animate() {
     let localWobble = wobbleScale;
     if (activePreset === "depth" && tile.layer === "fg") localWobble = 0.7;
     if (activePreset === "depth" && tile.layer === "bg") localWobble = 0.35;
-    if (activePreset === "showcase" && tile.role === "present") localWobble = 0.15;
-    if (activePreset === "showcase" && tile.role === "idle") localWobble = 0.4;
+    if (activePreset === "showcase" && tile.role === "present") localWobble = 0.25;
+    if (activePreset === "showcase" && tile.role === "idle") localWobble = 1.35;
+    if (
+      activePreset === "showcase" &&
+      (tile.role === "approach" || tile.role === "retreat")
+    ) {
+      localWobble = 0.45;
+    }
 
     const ox = Math.sin(t * 0.7 + tile.phase) * 0.02 * localWobble;
     const oy = Math.cos(t * 0.55 + tile.phase * 1.3) * 0.025 * localWobble;
@@ -1556,25 +1701,31 @@ function animate() {
 
     let spinMul = baseSpinMul;
     if (activePreset === "showcase") {
-      spinMul =
-        tile.role === "present"
-          ? 1.15
-          : tile.role === "approach" || tile.role === "retreat"
-            ? 0.65
-            : 0.28;
+      // Background floats only; spin while showcased in center FOV
+      spinMul = tile.role === "present" ? 1.05 : 0;
     }
 
-    tmpEuler.set(
-      tile.current.rotation.x + t * tile.spin.x * spinMul,
-      tile.current.rotation.y + t * tile.spin.y * spinMul,
-      tile.current.rotation.z + t * tile.spin.z * spinMul
-    );
-    tile.mesh.rotation.copy(tmpEuler);
+    if (spinMul === 0 && activePreset === "showcase") {
+      tile.mesh.rotation.copy(tile.current.rotation);
+    } else {
+      tmpEuler.set(
+        tile.current.rotation.x + t * tile.spin.x * spinMul,
+        tile.current.rotation.y + t * tile.spin.y * spinMul,
+        tile.current.rotation.z + t * tile.spin.z * spinMul
+      );
+      tile.mesh.rotation.copy(tmpEuler);
+    }
   }
 
-  // Subtle camera drift around the fixed framing
-  camera.position.x = 2.8 + Math.sin(t * 0.12) * 0.35;
-  camera.position.y = 1.6 + Math.sin(t * 0.17) * 0.15;
+  // Subtle camera drift around the fixed framing ( steadier for Showcase )
+  if (activePreset === "showcase") {
+    camera.position.x = 0.15 + Math.sin(t * 0.08) * 0.12;
+    camera.position.y = 0.35 + Math.sin(t * 0.11) * 0.08;
+    camera.position.z = 10.5;
+  } else {
+    camera.position.x = 2.8 + Math.sin(t * 0.12) * 0.35;
+    camera.position.y = 1.6 + Math.sin(t * 0.17) * 0.15;
+  }
   camera.lookAt(0, 0, 0);
 
   renderer.render(scene, camera);
