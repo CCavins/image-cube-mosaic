@@ -21,6 +21,8 @@ const showcaseHoldSlider = document.getElementById("showcase-hold-slider");
 const showcaseHoldValueEl = document.getElementById("showcase-hold-value");
 
 const PRESETS = [
+  { id: "showcase", label: "Showcase" },
+  { id: "depth", label: "Depth Field" },
   { id: "cluster", label: "Cluster" },
   { id: "orbit", label: "Orbit" },
   { id: "spiral", label: "Spiral" },
@@ -29,8 +31,6 @@ const PRESETS = [
   { id: "helix", label: "Helix" },
   { id: "grid", label: "Grid" },
   { id: "scatter", label: "Scatter" },
-  { id: "showcase", label: "Showcase" },
-  { id: "depth", label: "Depth Field" },
 ];
 
 // Box face order: +X, -X, +Y, -Y, +Z, -Z
@@ -84,10 +84,10 @@ const MAX_ACTIVE_FADES = 18; // limit simultaneous face fades per frame
 
 const images = [];
 let nextImageId = 1;
-let activePreset = "cluster";
+let activePreset = "showcase";
 let activeTileCount = MAX_TILES;
 let dwellMs = 4000;
-let showcaseHoldS = 4; // seconds between cycling one foreground cube
+let showcaseHoldS = 7; // seconds between cycling one foreground cube
 let showcaseSwapTimer = 0;
 let coverageTimer = 0;
 let densityApplyTimer = 0;
@@ -776,7 +776,7 @@ function getTargets(preset, i, count) {
 }
 
 const tiles = [];
-const initialTargets = buildAllTargets("cluster", MAX_TILES);
+const initialTargets = buildAllTargets("showcase", MAX_TILES);
 
 for (let i = 0; i < MAX_TILES; i++) {
   // Shared base material across all empty faces → far fewer GPU programs
@@ -808,22 +808,18 @@ for (let i = 0; i < MAX_TILES; i++) {
     pendingImage: null,
   }));
 
-  tiles.push({
+  const tile = {
     mesh,
     index: i,
     active: true,
     layer: target.layer || "fg",
     role: "idle", // showcase: idle | approach | present | retreat
     roleT: 0,
-    roleDuration: 1,
+    roleDuration: 0.4 + Math.random() * 5.5,
     presentSlot: null,
     presentAnchor: new THREE.Vector3(),
     phase: seededNoise(i, 20) * Math.PI * 2,
-    spin: new THREE.Vector3(
-      (seededNoise(i, 21) - 0.5) * 0.4,
-      (seededNoise(i, 22) - 0.5) * 0.55,
-      (seededNoise(i, 23) - 0.5) * 0.35
-    ),
+    spin: new THREE.Vector3(0, 0.32, 0),
     home: {
       position: target.position.clone(),
       rotation: target.rotation.clone(),
@@ -840,7 +836,9 @@ for (let i = 0; i < MAX_TILES; i++) {
       scale: target.scale,
     },
     faceSlots,
-  });
+  };
+  applySpinForPreset(tile, "showcase");
+  tiles.push(tile);
 }
 
 function emptyFaceMaterial(tile) {
