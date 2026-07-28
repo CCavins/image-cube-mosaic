@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Image Tile Field</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <canvas id="scene"></canvas>
+
+    <div class="vignette" aria-hidden="true"></div>
+
+    <header class="brand">
+      <span class="brand-mark" aria-hidden="true"></span>
+      <h1>Tile Field</h1>
+    </header>
+
+    <aside class="panel panel-left" aria-label="Library and motion controls">
+      <section class="panel-section">
+        <div class="panel-heading">
+          <h2>Library</h2>
+          <button type="button" id="clear-all" class="ghost-btn" disabled>Clear all</button>
+        </div>
+        <ul id="image-list" class="image-list">
+          <li class="empty-state">Drop images to begin</li>
+        </ul>
+      </section>
+
+      <section class="panel-section">
+        <h2>Motion</h2>
+        <div id="preset-list" class="preset-list" role="listbox" aria-label="Motion presets"></div>
+      </section>
+
+      <section class="panel-section">
+        <h2>Controls</h2>
+        <label class="slider-row" for="density-slider">
+          <span class="slider-label">
+            Density
+            <span id="density-value" class="slider-value">52</span>
+          </span>
+          <input
+            id="density-slider"
+            type="range"
+            min="8"
+            max="52"
+            value="52"
+            step="1"
+          />
+        </label>
+        <label class="slider-row" for="dwell-slider">
+          <span class="slider-label">
+            Image hold
+            <span id="dwell-value" class="slider-value">4.0s</span>
+          </span>
+          <input
+            id="dwell-slider"
+            type="range"
+            min="1"
+            max="12"
+            value="4"
+            step="0.5"
+          />
+        </label>
+        <label class="slider-row color-row" for="cube-color">
+          <span class="slider-label">
+            Cube color
+            <span id="cube-color-value" class="slider-value">#10131c</span>
+          </span>
+          <input id="cube-color" type="color" value="#10131c" />
+        </label>
+      </section>
+    </aside>
+
+    <aside class="panel panel-right" aria-label="Add images">
+      <div
+        id="drop-zone"
+        class="drop-zone"
+        tabindex="0"
+        role="button"
+        aria-label="Drag and drop images here, or click to browse"
+      >
+        <input
+          id="file-input"
+          type="file"
+          accept="image/*"
+          multiple
+          hidden
+        />
+        <div class="drop-icon" aria-hidden="true">
+          <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
+            <path
+              d="M14 5v12m0 0l-4.5-4.5M14 17l4.5-4.5M5 21.5h18"
+              stroke="currentColor"
+              stroke-width="1.6"
+              stroke-linecap="round"
+              stroke-linejoin="round"
+            />
+          </svg>
+        </div>
+        <p class="drop-title">Drop images</p>
+        <p class="drop-hint">or click to browse · PNG, JPG, WEBP</p>
+      </div>
+      <p class="status" id="status">Images cycle across cube faces over time</p>
+    </aside>
+
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "https://unpkg.com/three@0.170.0/build/three.module.js",
+          "three/addons/": "https://unpkg.com/three@0.170.0/examples/jsm/"
+        }
+      }
+    </script>
+    <script type="module" src="main.js?v=13"></script>
+  </body>
+</html>
