@@ -328,20 +328,28 @@ uniform float uImageMix;`
   return mat;
 }
 
-function downscaleImageElement(img, maxSize) {
-  const scale = Math.min(1, maxSize / Math.max(img.width, img.height));
-  if (scale >= 1) return img;
-  const w = Math.max(1, Math.round(img.width * scale));
-  const h = Math.max(1, Math.round(img.height * scale));
-  const c = document.createElement("canvas");
-  c.width = w;
-  c.height = h;
-  const ctx = c.getContext("2d");
-  ctx.drawImage(img, 0, 0, w, h);
-  return c;
+/**
+ * Center-cover into a square canvas: portrait scales to width (crop top/bottom),
+ * landscape scales to height (crop sides). One clean image per face texture.
+ */
+function makeCoverSquareCanvas(img, maxSize) {
+  const srcW = img.width || 1;
+  const srcH = img.height || 1;
+  const out = Math.max(1, Math.min(maxSize, Math.max(srcW, srcH)));
+  const scale = Math.max(out / srcW, out / srcH);
+  const dw = srcW * scale;
+  const dh = srcH * scale;
+  const canvas = document.createElement("canvas");
+  canvas.width = out;
+  canvas.height = out;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, out, out);
+  ctx.drawImage(img, (out - dw) / 2, (out - dh) / 2, dw, dh);
+  return canvas;
 }
 
-/** One GPU texture per library image — shared across all faces. */
+/** One GPU texture per library image — shared across faces; never clone (Source sharing bugs). */
 function ensureImageTexture(image) {
   if (image.texture) return image.texture;
 
@@ -353,18 +361,19 @@ function ensureImageTexture(image) {
   texture.magFilter = THREE.LinearFilter;
   texture.wrapS = THREE.ClampToEdgeWrapping;
   texture.wrapT = THREE.ClampToEdgeWrapping;
+  texture.flipY = true;
   image.texture = texture;
 
   const img = new Image();
   img.onload = () => {
-    texture.image = downscaleImageElement(img, MAX_TEX_SIZE);
+    texture.image = makeCoverSquareCanvas(img, MAX_TEX_SIZE);
     texture.needsUpdate = true;
-    // Oriented per-face clones share the image pixels — refresh them
+    // Materials already point at this texture — force a refresh
     for (const tile of tiles) {
       for (const slot of tile.faceSlots) {
-        if (slot.imageId === image.id && slot.orientedTexture) {
-          slot.orientedTexture.image = texture.image;
-          slot.orientedTexture.needsUpdate = true;
+        if (slot.imageId === image.id && slot.material) {
+          slot.material.map = texture;
+          slot.material.needsUpdate = true;
         }
       }
     }
@@ -381,9 +390,8 @@ function disposeImageTexture(image) {
   if (!image?.texture) return;
   for (const tile of tiles) {
     for (const slot of tile.faceSlots) {
-      if (slot.imageId === image.id && slot.orientedTexture) {
-        slot.orientedTexture.dispose();
-        slot.orientedTexture = null;
+      if (slot.imageId === image.id && slot.material) {
+        slot.material.map = null;
       }
     }
   }
@@ -687,7 +695,6 @@ for (let i = 0; i < MAX_TILES; i++) {
   const faceSlots = Array.from({ length: 6 }, () => ({
     imageId: null,
     material: null,
-    orientedTexture: null,
     fade: 0,
     state: "empty", // empty | fadingIn | holding | fadingOut
     holdUntil: 0,
@@ -897,28 +904,9 @@ function clearFaceSlot(tile, faceIndex) {
   slot.pendingImage = null;
 }
 
-function ensureOrientedTexture(slot, faceIndex, baseTexture) {
-  if (!slot.orientedTexture) {
-    slot.orientedTexture = baseTexture.clone();
-    slot.orientedTexture.colorSpace = THREE.SRGBColorSpace;
-    slot.orientedTexture.wrapS = THREE.ClampToEdgeWrapping;
-    slot.orientedTexture.wrapT = THREE.ClampToEdgeWrapping;
-    slot.orientedTexture.center.set(0.5, 0.5);
-    slot.orientedTexture.rotation = 0;
-    slot.orientedTexture.anisotropy = baseTexture.anisotropy;
-  }
-  // UVs are baked upright on the shared geometry — keep source flipY
-  slot.orientedTexture.image = baseTexture.image;
-  slot.orientedTexture.flipY = baseTexture.flipY;
-  slot.orientedTexture.rotation = 0;
-  slot.orientedTexture.needsUpdate = true;
-  return slot.orientedTexture;
-}
-
 function applyTextureToSlot(tile, faceIndex, image, { fadeIn = true, holdJitter = true } = {}) {
   const slot = tile.faceSlots[faceIndex];
-  const baseTexture = ensureImageTexture(image);
-  const texture = ensureOrientedTexture(slot, faceIndex, baseTexture);
+  const texture = ensureImageTexture(image);
 
   if (!slot.material) {
     slot.material = makeImageMaterial(texture);
@@ -1052,15 +1040,19 @@ function countImageUsage() {
 /**
  * Pick an image for a face: avoid other faces on the same cube when possible,
  * and prefer globally underused library images.
+ * Pass a mutable `usage` map when filling many faces in one batch.
  */
-function pickImageForTile(tile, { excludeFace = -1, alsoExcludeId = null } = {}) {
+function pickImageForTile(
+  tile,
+  { excludeFace = -1, alsoExcludeId = null, usage = null } = {}
+) {
   if (images.length === 0) return null;
   if (images.length === 1) return images[0];
 
   const onTile = imagesOnTile(tile, excludeFace);
   if (alsoExcludeId != null) onTile.add(alsoExcludeId);
 
-  const usage = countImageUsage();
+  const counts = usage ?? countImageUsage();
   let candidates = images.filter((img) => !onTile.has(img.id));
 
   // Last resort if the library is smaller than faces on the cube
@@ -1072,13 +1064,14 @@ function pickImageForTile(tile, { excludeFace = -1, alsoExcludeId = null } = {})
   let best = candidates[0];
   let bestScore = Infinity;
   for (const img of candidates) {
-    const used = usage.get(img.id) ?? 0;
+    const used = counts.get(img.id) ?? 0;
     const score = used + Math.random() * 0.35;
     if (score < bestScore) {
       bestScore = score;
       best = img;
     }
   }
+  counts.set(best.id, (counts.get(best.id) ?? 0) + 1);
   return best;
 }
 
@@ -1133,10 +1126,11 @@ function ensureFaceCoverage(force = false) {
       return scoreDiff + (Math.random() - 0.5) * 0.4;
     });
 
+  const usage = countImageUsage();
   const fillCount = Math.min(need, empties.length);
   for (let i = 0; i < fillCount; i++) {
     const { tile, face } = empties[i];
-    const image = pickImageForTile(tile, { excludeFace: face });
+    const image = pickImageForTile(tile, { excludeFace: face, usage });
     if (image) beginFaceCycle(tile, face, image);
   }
 }
